@@ -197,9 +197,8 @@ public class UnitTestUtil {
                 port = socket.getLocalPort();
                 try (DatagramSocket datagramSocket = new DatagramSocket(port)) {
                     datagramSocket.setReuseAddress(true);
-                    break;
                 } catch (SocketException e) {
-                    e.printStackTrace();
+                    continue;
                 }
 
                 CountDownLatch latch = new CountDownLatch(1);
