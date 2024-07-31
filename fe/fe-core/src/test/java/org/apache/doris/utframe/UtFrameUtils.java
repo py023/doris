@@ -444,7 +444,7 @@ public class UtFrameUtils {
     }
 
     public static int createMetaServer(String metaHost) throws IOException {
-        int metaBrpcPort = findValidPort();
+        int metaBrpcPort = UnitTestUtil.findValidPort();
 
         // start metaServer
         MockedMetaServer metaServer = MockedMetaServerFactory.createMetaServer(metaHost,

@@ -327,25 +327,9 @@ public abstract class DorisHttpTestCase {
 
     @BeforeClass
     public static void initHttpServer() throws IllegalArgException, InterruptedException {
-        ServerSocket socket = null;
-        try {
-            socket = new ServerSocket(0);
-            socket.setReuseAddress(true);
-            HTTP_PORT = socket.getLocalPort();
-            URI = "http://localhost:" + HTTP_PORT + "/api/" + DB_NAME + "/" + TABLE_NAME;
-            CloudURI = "http://localhost:" + HTTP_PORT;
-        } catch (Exception e) {
-            throw new IllegalStateException("Could not find a free TCP/IP port to start HTTP Server on");
-        } finally {
-            if (socket != null) {
-                try {
-                    socket.close();
-                } catch (Exception e) {
-                    // CHECKSTYLE IGNORE THIS LINE
-                }
-            }
-        }
-
+        HTTP_PORT = UnitTestUtil.findValidPort();
+        URI = "http://localhost:" + HTTP_PORT + "/api/" + DB_NAME + "/" + TABLE_NAME;
+        CloudURI = "http://localhost:" + HTTP_PORT;
         FeConstants.runningUnitTest = true;
         httpServer = new HttpServer();
         httpServer.setPort(HTTP_PORT);

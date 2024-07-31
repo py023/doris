@@ -190,36 +190,19 @@ public class UnitTestUtil {
     }
 
     public static int findValidPort() {
-        int port = 0;
-        for (int i = 0; i < 65535; i++) {
+        int port;
+        while (true) {
             try (ServerSocket socket = new ServerSocket(0)) {
                 socket.setReuseAddress(true);
                 port = socket.getLocalPort();
                 try (DatagramSocket datagramSocket = new DatagramSocket(port)) {
                     datagramSocket.setReuseAddress(true);
+                    break;
                 } catch (SocketException e) {
-                    continue;
+                    System.out.println("The port " + port + " is invalid and try another port.");
                 }
-
-                CountDownLatch latch = new CountDownLatch(1);
-                final int serverPort = port;
-                new Thread(() -> {
-                    try (Socket clientSocket = new Socket()) {
-                        clientSocket.connect(new InetSocketAddress("localhost", serverPort));
-                        latch.await();  // Wait until the server closes the connection
-                    } catch (IOException | InterruptedException e) {
-                        // CHECKSTYLE IGNORE THIS LINE
-                    }
-                }).start();
-                // Accept a connection from the client
-                try (Socket serverConn = socket.accept()) {
-                    // CHECKSTYLE IGNORE THIS LINE
-                } catch (IOException e) {
-                    // CHECKSTYLE IGNORE THIS LINE
-                }
-                latch.countDown();  // Signal that the server has closed the connection
             } catch (IOException e) {
-                throw new IllegalStateException("Could not find a free TCP/IP port");
+                throw new IllegalStateException("Could not find a free TCP/IP port to start HTTP Server on");
             }
         }
         return port;
