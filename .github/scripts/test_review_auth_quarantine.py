@@ -155,6 +155,7 @@ class ReviewAuthQuarantineTest(unittest.TestCase):
             "REPO": "example/repo", "PR_NUMBER": "1", "HEAD_SHA": "a" * 40,
             "GITHUB_WORKSPACE": str(self.root),
             "BASE_SHA": "b" * 40, "HELPER_REF": "test-pin", "REVIEW_TIMEOUT_MINUTES": "120",
+            "REVIEW_MODEL": "gpt-6-sol", "REVIEW_REASONING_EFFORT": "xhigh",
             "FAKE_REVIEW_HELPER": str(Path(__file__).resolve().with_name("run_review_with_resume.py")),
         })
         self.new_runner()
@@ -163,7 +164,7 @@ class ReviewAuthQuarantineTest(unittest.TestCase):
         runner = Path(tempfile.mkdtemp(dir=self.root))
         context = runner / "review-context"
         context.mkdir()
-        (context / "codex_goal_prompt.txt").write_text("Fake review")
+        (context / "review_prompt.txt").write_text("Fake review")
         self.env.update({
             "RUNNER_TEMP": str(runner), "CODEX_HOME": str(runner / "codex-home"),
             "GITHUB_ENV": str(runner / "env"), "GITHUB_OUTPUT": str(runner / "output"),
@@ -177,7 +178,7 @@ class ReviewAuthQuarantineTest(unittest.TestCase):
                 self.skipTest("review helper process supervision requires Linux")
             # Each invocation models a separate review step with its own attempt files.
             context = Path(tempfile.mkdtemp(dir=self.env["RUNNER_TEMP"]))
-            (context / "codex_goal_prompt.txt").write_text("Fake review")
+            (context / "review_prompt.txt").write_text("Fake review")
             self.env["REVIEW_CONTEXT_DIR"] = str(context)
         output = Path(self.env["GITHUB_OUTPUT"])
         output.write_text("")

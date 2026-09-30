@@ -74,7 +74,7 @@ class ResumeReviewTest(unittest.TestCase):
             effort="xhigh",
             budget_seconds=1000,
         )
-        (self.context / "codex_goal_prompt.txt").write_text(
+        (self.context / "review_prompt.txt").write_text(
             "Read review_prompt.txt; complete the review."
         )
         self.ledger = self.context / "subagent_review_findings.md"
@@ -178,7 +178,7 @@ class ResumeReviewTest(unittest.TestCase):
         command = self.commands[1]
         self.assertEqual(["resume", THREAD], command[-3:-1])
         self.assertNotIn("--last", command)
-        for option in ("--goal", "--cd", "--model", "--config", "--sandbox", "--json"):
+        for option in ("--cd", "--model", "--config", "--sandbox", "--json"):
             self.assertIn(option, command)
         self.assertEqual("gpt-5.6-sol", command[command.index("--model") + 1])
         self.assertIn("do not restart the review", command[-1])
@@ -238,7 +238,7 @@ class ResumeReviewTest(unittest.TestCase):
         ):
             with self.subTest(message=message), tempfile.TemporaryDirectory() as tmp:
                 self.args.context_dir = Path(tmp)
-                (self.args.context_dir / "codex_goal_prompt.txt").write_text("review")
+                (self.args.context_dir / "review_prompt.txt").write_text("review")
                 self.assertEqual(
                     1,
                     self.execute(
@@ -346,7 +346,7 @@ class ResumeReviewTest(unittest.TestCase):
         ):
             with self.subTest(message=message), tempfile.TemporaryDirectory() as tmp:
                 self.args.context_dir = Path(tmp)
-                (self.args.context_dir / "codex_goal_prompt.txt").write_text("review")
+                (self.args.context_dir / "review_prompt.txt").write_text("review")
                 self.assertEqual(1, self.execute([{"events": [failed(message)]}]))
                 self.assertEqual(
                     message,
@@ -411,7 +411,7 @@ class ResumeReviewTest(unittest.TestCase):
         )
         self.assertIn("different session", self.last_error())
 
-    def test_unsupported_goal_resume_fails_without_new_request(self):
+    def test_unsupported_resume_fails_without_new_request(self):
         self.help.side_effect = subprocess.CalledProcessError(
             2, ["codex", "exec", "--help"]
         )
@@ -896,7 +896,7 @@ class ProcessLifecycleTest(unittest.TestCase):
     def test_real_process_capacity_then_resume_preserves_state(self):
         with tempfile.TemporaryDirectory() as tmp, redirect_stderr(io.StringIO()):
             root = Path(tmp)
-            (root / "codex_goal_prompt.txt").write_text("test review")
+            (root / "review_prompt.txt").write_text("test review")
             ledger = root / "subagent_review_findings.md"
             ledger.write_text("completed round 1")
             fake_codex = root / "codex"
@@ -906,7 +906,7 @@ class ProcessLifecycleTest(unittest.TestCase):
 import json, os, sys
 from pathlib import Path
 if "--help" in sys.argv:
-    print("exec --goal resume SESSION_ID PROMPT")
+    print("exec resume SESSION_ID PROMPT")
     sys.exit(0)
 root = Path(os.environ["FAKE_REVIEW_ROOT"])
 thread_id = os.environ["FAKE_THREAD_ID"]
@@ -999,7 +999,7 @@ else:
     def test_cli_sigterm_cleans_up_child_and_does_not_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "codex_goal_prompt.txt").write_text(
+            (root / "review_prompt.txt").write_text(
                 "test only; do not call a service"
             )
             fake_codex = root / "codex"
@@ -1083,7 +1083,7 @@ else:
     def check_detached_descendants(self, stop, graceful):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "codex_goal_prompt.txt").write_text("local process test only")
+            (root / "review_prompt.txt").write_text("local process test only")
             fake_codex = root / "codex"
             fake_codex.write_text(
                 f"#!{sys.executable}\n"

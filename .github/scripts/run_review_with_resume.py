@@ -308,20 +308,20 @@ def check_resume_target(args, started_at, remaining):
                 )
 
 
-def resume_prompt(goal_prompt):
+def resume_prompt(review_prompt):
     return (
-        goal_prompt
+        review_prompt
         + "\n\n"
         + (
             "Recovery after a temporary model-capacity error in this SAME review session. "
             "Continue unfinished work using the existing conversation and shared subagent review ledger; "
             "do not restart the review, reset the ledger, or reset the three-round limit. "
             "The previous process exited: do not assume child agents or shell processes are still running. "
-            "Recover unfinished child-agent work using their recorded IDs and ledger sections where possible. "
+            "Recover unfinished child-agent work using their recorded IDs and ledger files where possible. "
             "Keep completed findings and replace only work that could not be recovered. "
             "Before any GitHub write, fetch the current PR reviews and inline comments again; "
             "the initial snapshots may be stale. Verify already-submitted work and never submit it twice. "
-            "Mark the goal complete only after the original review completion criteria are satisfied."
+            "Finish only after the original review completion criteria are satisfied."
         )
     )
 
@@ -335,7 +335,7 @@ def run_review(args, reaper=None):
     attempts.mkdir()
     aggregate.touch()
     stderr_log.touch()
-    goal_prompt = (context / "codex_goal_prompt.txt").read_text()
+    review_prompt = (context / "review_prompt.txt").read_text()
     deadline = time.monotonic() + args.budget_seconds
     started_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     thread_id = None
@@ -370,7 +370,6 @@ def run_review(args, reaper=None):
             command = [
                 "codex",
                 "exec",
-                "--goal",
                 "--cd",
                 str(args.cwd),
                 "--model",
@@ -386,9 +385,9 @@ def run_review(args, reaper=None):
                 str(output_path),
             ]
             if thread_id:
-                command += ["resume", thread_id, resume_prompt(goal_prompt)]
+                command += ["resume", thread_id, resume_prompt(review_prompt)]
             else:
-                command += [goal_prompt]
+                command += [review_prompt]
             print(
                 f"Starting Codex review attempt {attempt + 1}/4 "
                 f"(session={thread_id or 'new'}, remaining={remaining():.0f}s)",
@@ -437,7 +436,7 @@ def run_review(args, reaper=None):
             require_rollout(Path(os.environ["CODEX_HOME"]), thread_id, args.cwd)
             # Check parser support without authenticating or starting a model request.
             subprocess.run(
-                ["codex", "exec", "--goal", "resume", "--help"],
+                ["codex", "exec", "resume", "--help"],
                 check=True,
                 capture_output=True,
                 timeout=min(10, remaining()),
