@@ -34,14 +34,3 @@ failures do not replace the original request failure.
 
 Submission evidence is retained under `--artifacts-dir/review`. Neither
 credential files nor the full CODEX_HOME are published as build artifacts.
-
-Local validation:
-
-~~~sh
-cd regression-test/pipeline/code-review
-RUN_GH_HTTP_TESTS=1 python3 -m unittest discover -s tests -t .
-~~~
-
-The opt-in HTTP test uses real gh only against a loopback server, with fake
-tokens and a temporary config; it never sends a request to GitHub. Linux-only
-process-supervision tests require a Linux host.
