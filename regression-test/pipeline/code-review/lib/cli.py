@@ -24,7 +24,7 @@ import logging
 import os
 import signal
 import tempfile
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from pathlib import Path
 
 from auth_pool import AuthPool
@@ -32,7 +32,6 @@ from events import Event
 from forward import build_request, enqueue
 from github_client import GitHub
 from lifecycle import Workspace
-from locking import Locks
 from object_store import ObjectStore
 from process import sh, step
 from review_runtime import Runtime
@@ -77,19 +76,14 @@ def parser():
     common.add_argument("--repository", required=True)
     common.add_argument("--github-token-file", type=Path,
                         help="Token text file; otherwise use the existing gh login")
-    common.add_argument("--dry-run", action="store_true",
-                        help="Read live services but simulate GitHub/OSS writes locally; never upload telemetry")
     common.add_argument("--request-id", required=True)
     common.add_argument("--run-url", required=True)
     common.add_argument("--run-id", required=True)
-    common.add_argument("--state-root", type=Path, required=True,
-                        help="Shared writable host directory, mounted identically into all agents")
     common.add_argument("--artifacts-dir", type=Path, required=True)
     common.add_argument("--skip-policy", type=Path, default=ROOT / "skip-policy.json")
     common.add_argument("--api-timeout", type=positive,
                         help="Optional per-call limit; workflow steps enforce their original overall budgets")
     common.add_argument("--sync-timeout", type=positive, default=21600)
-    common.add_argument("--lock-timeout", type=positive, default=14400)
     common.add_argument("--temp-dir", type=Path, help="Build-private directory managed/cleaned by the CI agent")
     commands.add_parser("sync", parents=[common], help="Validate local/skip events and aggregate status")
     review = commands.add_parser("review", parents=[common], help="Execute automated review or runtime canary")
@@ -114,15 +108,9 @@ def parser():
     review.add_argument("--context-body-chars", type=positive, default=1200)
     review.add_argument("--templates", type=Path, default=ROOT / "prompts")
     review.add_argument("--ossutil", default="ossutil")
-    review.add_argument("--oss-endpoint")
-    review.add_argument("--oss-access-key-file", type=Path)
-    review.add_argument("--oss-secret-key-file", type=Path)
-    review.add_argument("--rclone", default="rclone", help="Read-only OSS transport for --dry-run")
-    review.add_argument("--rclone-remote", default="oss:")
-    review.add_argument("--rclone-endpoint", help="Optional S3 endpoint override for local reads")
-    review.add_argument("--local-codex-loader", type=Path,
-                        help="Optional isolated ELF loader for --dry-run on older Linux hosts")
-    review.add_argument("--local-codex-library-path", type=Path)
+    review.add_argument("--oss-endpoint", required=True)
+    review.add_argument("--oss-access-key-file", type=Path, required=True)
+    review.add_argument("--oss-secret-key-file", type=Path, required=True)
     review.add_argument("--oss-timeout", type=positive, help="Optional per-command limit")
     review.add_argument("--auth-prefix", required=True)
     review.add_argument("--codex-package", required=True)
@@ -141,8 +129,6 @@ def parser():
     review.add_argument("--environment", default="teamcity")
     review.add_argument("--workflow-name", default="Code Review Runner")
     review.add_argument("--canary-auth-object", default="")
-    review.add_argument("--canary-case", action="append",
-                        help="Ordered LABEL:MODEL:EFFORT:plain|goal; every case must pass")
     review.add_argument("--canary-timeout", type=positive, default=180)
     review.add_argument("--canary-step-timeout", type=positive, default=1080)
     review.add_argument("--canary-job-timeout", type=positive, default=1500)
@@ -171,12 +157,6 @@ def configure_environment(options):
 
 @contextmanager
 def object_store(options):
-    if options.dry_run:
-        from local_services import ReadOnlyObjectStore
-        yield ReadOnlyObjectStore(options)
-        return
-    if not all((options.oss_endpoint, options.oss_access_key_file, options.oss_secret_key_file)):
-        raise ValueError("Live review requires --oss-endpoint, --oss-access-key-file and --oss-secret-key-file")
     with tempfile.TemporaryDirectory(prefix="review-secrets-", dir=options.temp_dir) as temporary:
         config_path = Path(temporary) / "ossutil.ini"
         config = configparser.ConfigParser(interpolation=None)
@@ -191,33 +171,17 @@ def object_store(options):
 
 
 def run_worker(options):
-    with ExitStack() as stack:
-        return _run_worker(options, stack)
-
-
-def _run_worker(options, stack):
     event = Event(options.event_name, json.loads(options.event_file.read_text()))
     if event.data["repository"]["full_name"] != options.repository:
         raise ValueError("Event repository does not match the configured repository")
     if options.command == "review" and not (event.review or event.canary):
         logging.info("Event does not request an authorized automated review")
         return 0
-    if not options.state_root.is_absolute():
-        raise ValueError("--state-root must be the shared absolute host path")
-    options.state_root = options.state_root.resolve()
-    if options.dry_run:
-        options.state_root /= "dry-run"
     options.artifacts_dir = options.artifacts_dir.resolve()
     options.artifacts_dir.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ) if event.canary else configure_environment(options)
-    if options.dry_run:
-        from local_services import LocalGitHub
-        local = stack.enter_context(LocalGitHub(options, env))
-        env = local.environment(env)
-        options.local_gateway = local
     github = GitHub(options.repository, env=env, timeout=options.api_timeout)
-    locks = Locks(options.state_root / "locks", timeout=options.lock_timeout)
-    statuses = StatusWorkflow(github, locks, run_url=options.run_url,
+    statuses = StatusWorkflow(github, run_url=options.run_url,
                               skip_policy=json.loads(options.skip_policy.read_text()))
     if options.command == "sync":
         with step("Synchronize review status", options.sync_timeout):
@@ -232,16 +196,11 @@ def _run_worker(options, stack):
             if event.canary:
                 if not options.canary_auth_object:
                     raise ValueError("Canary requires --canary-auth-object")
-                if options.canary_case is None:
-                    options.canary_case = ["sol:gpt-6-sol:low:plain", "prior-sol:gpt-5.6-sol:low:plain",
-                                           "sol-goal:gpt-6-sol:low:goal", "sol61:gpt-6.1-sol:xhigh:plain",
-                                           "sol61-goal:gpt-6.1-sol:xhigh:goal"]
                 from canary import run_canary
                 return run_canary(options, runtime, workspace)
             if not options.review_author or not options.trusted_revision:
                 raise ValueError("Review requires --review-author and --trusted-revision")
-            with locks.hold("pull-requests", f"{options.repository}:{event.pr_number}"):
-                return ReviewWorkflow(options, github, statuses, runtime).run(event, workspace)
+            return ReviewWorkflow(options, github, statuses, runtime).run(event, workspace)
 
 
 def main(argv=None):

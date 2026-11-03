@@ -38,7 +38,6 @@ val trusted = GitVcsRoot {
 
 val sharedArguments = """
     --repository "%review.repository%"
-    --state-root "%review.state.root%"
     --artifacts-dir "%teamcity.build.checkoutDir%/review-artifacts"
 """.trimIndent().replace("\n", " ")
 
@@ -57,7 +56,8 @@ val reviewArguments = """
 fun reviewBuild(identifier: String, title: String, mode: String) = BuildType {
     id(identifier)
     name = title
-    // Capacity comes from the existing agent pool, not an account-wide lock.
+    // Configure per-PR review and per-SHA status serialization in TeamCity.
+    // Workers do not lock; capacity comes from the agent pool.
     maxRunningBuilds = 0
     // FIXME: configure TeamCity artifact cleanup to retain failed-review
     // diagnostics for 14 days, matching the former upload-artifact retention.
@@ -99,8 +99,7 @@ fun reviewBuild(identifier: String, title: String, mode: String) = BuildType {
     }
     requirements {
         equals("teamcity.agent.jvm.os.name", "Linux")
-        // FIXME: add review.worker=true to each eligible agent. All 12 agents
-        // must share review.state.root for PR/SHA mutexes, with the same UID.
+        // FIXME: add review.worker=true to each eligible agent.
         // CODEX_HOME, PR checkouts and packages are private to each build.
         equals("review.worker", "true")
     }
@@ -113,7 +112,6 @@ project {
         // FIXME: confirm deployment values; current workflow values are retained.
         param("review.repository", "apache/doris")
         param("review.repository.url", "https://github.com/apache/doris.git")
-        param("review.state.root", "FIXME_SHARED_ABSOLUTE_DIRECTORY")
         param("review.author", "FIXME_GITHUB_BOT_LOGIN")
         param("review.model", "gpt-6.1-sol")
         param("review.fallback.model", "gpt-6-sol")

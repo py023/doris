@@ -27,20 +27,16 @@ from validate_review_pass_comment import parse_comment, require_full_sha, valida
 
 
 class StatusWorkflow:
-    def __init__(self, github, locks, *, run_url, skip_policy):
+    def __init__(self, github, *, run_url, skip_policy):
         self.github = github
-        self.locks = locks
         self.run_url = run_url
         self.skip_policy = skip_policy
-
-    def _lock(self, head):
-        return self.locks.hold("status", f"{self.github.repository}:{head.lower()}")
 
     @staticmethod
     def source(kind, number, base):
         return f"code-review/source/{kind}/pr-{number}/base-{base}"
 
-    def _aggregate(self, head):
+    def aggregate(self, head):
         self.github.status(head, "code-review", "pending",
                            f"Recalculating code review for {head[:12]}.", self.run_url)
         pulls = self.github.api("pulls?state=open&per_page=100", pages=True)
@@ -49,10 +45,6 @@ class StatusWorkflow:
         self.github.status(head, "code-review", resolution.state,
                            resolution.description, self.run_url)
         return resolution
-
-    def aggregate(self, head):
-        with self._lock(head):
-            return self._aggregate(head)
 
     def begin_review(self, number, head, base):
         self.github.status(head, "code-review", "pending",

@@ -26,7 +26,6 @@ from pathlib import Path
 
 from packages import digest, install_codex, restore_memories
 from process import sh, step
-from review_github_api import redact, redact_json
 
 
 class Runtime:
@@ -46,9 +45,6 @@ class Runtime:
         with step("Verify pinned Codex runtime", options.canary_job_timeout if canary else options.verify_timeout):
             if not canary and digest(binary) != options.codex_binary_checksum:
                 raise ValueError("Codex binary SHA256 does not match the pinned runtime")
-            if options.dry_run:
-                env = options.local_gateway.isolate_codex(binary, workspace, env)
-                binary = Path(shutil.which("codex", path=env["PATH"]))
             sh(str(binary), "--version", env=env)
             help_text = sh(str(binary), "exec", "--help", env=env, capture=True).stdout
             if "--goal" not in help_text:
@@ -87,37 +83,17 @@ class Runtime:
             if not self.store.session_exists(remote):
                 self.store.upload(path, remote)
 
-    def diagnostics(self, context, *, local=False):
+    def diagnostics(self, context):
         # Never copy CODEX_HOME/auth.json or the entire private workspace.
         output = self.options.artifacts_dir / "review"
         output.mkdir(parents=True, exist_ok=True)
-        names = ("review-result.json", "review-submission-rejected.json", "review-submission.json",
-                 "review-api-errors.jsonl", "codex-stderr.log", "codex-final-message.txt",
-                 "codex-events.jsonl", "codex-review-model.txt", "review_prompt.txt",
-                 "subagent_review_findings.md", "pr_changed_files.txt", "review_focus.txt")
-        if not local:
-            names = ("review-submission.json", "review-submission-rejected.json", "review-api-errors.jsonl")
-        for name in names:
+        for name in ("review-submission.json", "review-submission-rejected.json", "review-api-errors.jsonl"):
             source = context / name
             if source.exists():
-                if not local:
-                    shutil.copyfile(source, output / name)
-                    continue
-                content = source.read_text()
-                if source.suffix == ".json":
-                    content = json.dumps(redact_json(json.loads(content)), indent=2) + "\n"
-                elif source.suffix == ".jsonl":
-                    content = "".join(json.dumps(redact_json(json.loads(line))) + "\n"
-                                      for line in content.splitlines() if line.strip())
-                else:
-                    content = redact(content)
-                (output / name).write_text(content)
+                shutil.copyfile(source, output / name)
 
     def telemetry(self, context, home, target, *, superseded):
         options = self.options
-        if options.dry_run:
-            logging.info("Dry run: telemetry upload is disabled")
-            return
         if not options.telemetry_url:
             logging.info("Telemetry is disabled (no telemetry URL configured)")
             return
