@@ -15,19 +15,77 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Build immutable review inputs from a checked-out PR and trusted templates."""
-
 import json
 import logging
+import re
 import shlex
 import subprocess
 import sys
-import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-from prepare_review_agents import prepare_review_skill, required_agents, valid_changed_path
-from process import sh, step
+from process import require, require_full_sha, sh, step, write_json
 from review_github_api import redact
+
+SKILL_PATH = ".claude/skills/code-review/SKILL.md"
+
+
+SKILL_FALLBACK_BRANCHES = {"branch-4.2", "branch-4.1", "branch-4.0"}
+
+
+GUIDE_REFERENCE = re.compile(r"`([^`\n]+/AGENTS\.md)`")
+
+
+def required_agents(root, changed):
+    candidates = dict.fromkeys(["AGENTS.md", *[str(parent / "AGENTS.md")
+        for name in changed for parent in reversed(PurePosixPath(name).parents) if str(parent) != "."]])
+    return [name for name in candidates if (root / name).is_file()]
+
+
+def prepare_review_skill(root, branch, revision, context):
+    path = SKILL_PATH
+    note = ""
+    if branch in SKILL_FALLBACK_BRANCHES and not (root / path).is_file():
+        require_full_sha("trusted revision", revision)
+        context.resolve().relative_to(root)
+        available = sh("git", "cat-file", "-e", f"{revision}^{{commit}}", cwd=root, capture=True, check=False)
+        if available.returncode:
+            sh("git", "fetch", "--no-tags", "origin", revision, cwd=root)
+
+        def read_trusted(name):
+            return sh("git", "show", f"{revision}:{name}", cwd=root, capture=True).stdout
+
+        bundle, sources = context / "review-guidance", {}
+
+        def guide(match):
+            name = match[1]
+            if "..." in PurePosixPath(name).parts:
+                return match[0]
+            require(not PurePosixPath(name).is_absolute() and ".." not in PurePosixPath(name).parts,
+                    "Guide path escapes the repository")
+            if name not in sources:
+                target = root / name
+                if target.is_file():
+                    target.resolve().relative_to(root)
+                else:
+                    target = bundle / name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(read_trusted(name))
+                sources[name] = target.relative_to(root).as_posix()
+            return f"`{sources[name]}`"
+
+        skill = GUIDE_REFERENCE.sub(guide, read_trusted(path))
+        target = bundle / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(skill)
+        path = target.relative_to(root).as_posix()
+        write_json(context / "review_guidance_sources.json",
+                   dict(base_ref=branch, trusted_ref=revision, skill=path, guides=sources))
+        note = (f"The workflow supplied missing guidance from {revision}. Existing checkout guides and branch code "
+                "take precedence. Use fallback guides as checklists; verify rules against this branch and do not "
+                "assume newer layouts or features exist. Source-code paths are relative to the repository root.\n")
+    if branch not in SKILL_FALLBACK_BRANCHES:
+        return "Before reviewing code, read and strictly follow the code review skill in this repository.\n"
+    return f"Before reviewing code, read and follow `{path}`. Pass this exact path to every review subagent.\n" + note
 
 
 def checkout(repository_url, directory, head, base, *, timeout):
@@ -74,10 +132,8 @@ def existing_threads(github, number, context, *, max_threads, max_body_chars):
 
 
 def prepare(github, pr_dir, target, *, trusted_revision, focus, timeout,
-            max_threads, max_body_chars, context=None, threads_timeout=300, focus_timeout=120):
+            max_threads, max_body_chars, context, threads_timeout, focus_timeout):
     number, head, base = target["number"], target["head"], target["base"]
-    if context is None:
-        context = Path(tempfile.mkdtemp(prefix=".code-review.", dir=pr_dir))
     with step("Fetch existing PR review threads", threads_timeout):
         existing_threads(github, number, context, max_threads=max_threads, max_body_chars=max_body_chars)
     with step("Prepare user review focus", focus_timeout):
@@ -100,8 +156,7 @@ def prepare(github, pr_dir, target, *, trusted_revision, focus, timeout,
                   cwd=pr_dir, timeout=timeout, capture=True).stdout
         (context / "pr_changed_files.txt").write_text(changed)
         (context / "pr.diff").write_text(diff)
-        paths = [path for path in map(valid_changed_path, changed.splitlines()) if path is not None]
-        agents = required_agents(pr_dir, paths)
+        agents = required_agents(pr_dir, changed.splitlines())
         guides = "".join(f"- {path}\n" for path in agents) or "- No AGENTS.md files found.\n"
         (context / "required_agents.txt").write_text("".join(path + "\n" for path in agents))
         skill = prepare_review_skill(pr_dir, live["base"]["ref"], trusted_revision, context)
@@ -128,10 +183,6 @@ def render_prompt(github, pr_dir, target, context, guides, skill, templates):
     (context / "review_prompt.txt").write_text(prompt)
     (context / "subagent_review_findings.md").write_text((templates / "ledger.txt").read_text())
     (context / "codex_goal_prompt.txt").write_text(
-        "You are performing an automated code review inside a CI review worker.\n"
-        "This invocation is already running in Codex goal mode. Before inspecting the PR diff or related code, "
-        f"read {relative}/review_prompt.txt verbatim and follow that file as the complete review instruction set.\n"
-        "This document outlines the complete process, cyclic procedures, and exit agreements you need to follow. "
-        "Please read it seriously and reconfirm the requirements at the end of each cycle. "
-        "Complete the review according to the stipulations in this document.\n"
-    )
+        "You are performing automated code review in a CI worker, already in Codex goal mode. "
+        f"Before inspecting any code, read {relative}/review_prompt.txt verbatim as the complete instruction set. "
+        "Follow its review cycles and exit criteria, and reconfirm them at the end of each cycle.\n")

@@ -22,28 +22,18 @@ import argparse
 import hashlib
 import json
 import re
-import subprocess
-import sys
 import time
 from collections import Counter
-from datetime import datetime, timezone
 from pathlib import Path
 
-from review_github_api import decode_json, redact, run_gh
-
+from process import require, write_json
+from review_github_api import request_json
 
 SUBMISSION_FILE = "review-submission.json"
 REJECTION_FILE = "review-submission-rejected.json"
-API_ERRORS_FILE = "review-api-errors.jsonl"
 RUN_FILE = "review-run.json"
 RESULT_FILE = "review-result.json"
 PRIORITY = re.compile(r"^\[P([0-3])\]\s+\S")
-
-
-def write_json(path, value):
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(value, indent=2) + "\n")
-    temporary.replace(path)
 
 
 def priority(body):
@@ -54,99 +44,32 @@ def priority(body):
 
 
 def validate_submission(value):
-    if not isinstance(value, dict) or set(value) != {
-        "body", "comments", "existing_blocking_comment_ids",
-        "converged", "rounds", "incomplete_reason"
-    }:
-        raise ValueError(
-            "Final review requires body, comments, existing_blocking_comment_ids, "
-            "converged, rounds and incomplete_reason"
-        )
-    if type(value["converged"]) is not bool:
-        raise ValueError("converged must be a boolean")
-    if type(value["rounds"]) is not int or not 1 <= value["rounds"] <= 3:
-        raise ValueError("rounds must be an integer from 1 to 3")
+    fields = {"body", "comments", "existing_blocking_comment_ids", "converged", "rounds", "incomplete_reason"}
+    require(isinstance(value, dict) and set(value) == fields, f"Final review requires {sorted(fields)}")
+    require(type(value["converged"]) is bool, "converged must be a boolean")
+    require(type(value["rounds"]) is int and 1 <= value["rounds"] <= 3, "rounds must be an integer from 1 to 3")
     reason = value["incomplete_reason"]
-    if not isinstance(reason, str):
-        raise ValueError("incomplete_reason must be text")
-    if value["converged"]:
-        if reason.strip():
-            raise ValueError("A converged review cannot have an incomplete_reason")
-    elif value["rounds"] != 3 or not reason.strip():
-        raise ValueError("A non-converged review requires three rounds and an incomplete_reason")
-    if not isinstance(value["body"], str) or not value["body"].strip():
-        raise ValueError("Final review summary is empty")
-    if not isinstance(value["comments"], list):
-        raise ValueError("comments must be an array")
+    require(isinstance(reason, str), "incomplete_reason must be text")
+    require(not reason.strip() if value["converged"] else value["rounds"] == 3 and bool(reason.strip()),
+            "Only a non-converged review after three rounds requires an incomplete_reason")
+    require(isinstance(value["body"], str) and value["body"].strip(), "Final review summary is empty")
+    require(isinstance(value["comments"], list), "comments must be an array")
     for comment in value["comments"]:
-        if not isinstance(comment, dict) or set(comment) != {"path", "position", "body"}:
-            raise ValueError("Each finding requires path, position and body")
-        if not isinstance(comment["path"], str) or not comment["path"]:
-            raise ValueError("Finding path is empty")
-        if type(comment["position"]) is not int or comment["position"] <= 0:
-            raise ValueError("Finding position must be a positive diff position")
-        if not isinstance(comment["body"], str):
-            raise ValueError("Finding body must be text")
+        require(isinstance(comment, dict) and set(comment) == {"path", "position", "body"},
+                "Each finding requires path, position and body")
+        require(isinstance(comment["path"], str) and comment["path"], "Finding path is empty")
+        require(type(comment["position"]) is int and comment["position"] > 0, "Finding position must be positive")
+        require(isinstance(comment["body"], str), "Finding body must be text")
         priority(comment["body"])
     ids = value["existing_blocking_comment_ids"]
-    if not isinstance(ids, list) or any(type(i) is not int or i <= 0 for i in ids):
-        raise ValueError("Existing blocking comment IDs must be positive integers")
-    if len(set(ids)) != len(ids):
-        raise ValueError("Existing blocking comment IDs must be unique")
+    require(isinstance(ids, list) and all(type(i) is int and i > 0 for i in ids),
+            "Existing blocking comment IDs must be positive integers")
+    require(len(set(ids)) == len(ids), "Existing blocking comment IDs must be unique")
     return value
 
 
-def diagnostic_text(value):
-    value = redact(value)
-    return value[:65536] + ("\n[truncated after 65536 characters]" if len(value) > 65536 else "")
-
-
-class GitHubAPIError(ValueError):
-    def __init__(self, path, method, error, stdout=None, stderr=None):
-        self.details = {
-            "method": method, "path": path, "error_type": type(error).__name__,
-            "returncode": getattr(error, "returncode", None),
-            "timeout_seconds": getattr(error, "timeout", None),
-            "stdout": diagnostic_text(stdout), "stderr": diagnostic_text(stderr),
-        }
-        message = (
-            f"GitHub API {method} {path} failed ({type(error).__name__}, "
-            f"exit={self.details['returncode']}, timeout={self.details['timeout_seconds']}); "
-            f"stderr={json.dumps(self.details['stderr'][:1000])}; "
-            f"stdout={json.dumps(self.details['stdout'][:1000])}"
-        )
-        self.details["message"] = message
-        super().__init__(message)
-
-
 def api(path, remaining, *, payload=None, paginated=False):
-    command = ["gh", "api", path]
-    if paginated:
-        command += ["--paginate", "--slurp"]
-    if payload is not None:
-        command += ["--method", "POST", "--input", "-"]
-    method = "POST" if payload is not None else "GET"
-    try:
-        result = run_gh(
-            command, input=json.dumps(payload) if payload is not None else None,
-            capture_output=True, text=True, check=True, timeout=min(30, remaining()),
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-        raise GitHubAPIError(path, method, error, error.stdout, error.stderr) from None
-    try:
-        value = decode_json(result, command)
-    except json.JSONDecodeError as error:
-        raise GitHubAPIError(path, method, error, result.stdout, result.stderr) from None
-    return [item for page in value for item in page] if paginated else value
-
-
-def with_api_failure(context, reason):
-    diagnostics = context / API_ERRORS_FILE
-    if diagnostics.exists():
-        with diagnostics.open() as handle:
-            first = json.loads(next(handle))
-        reason += f"; first recorded API failure: {first['message']} (see {API_ERRORS_FILE})"
-    return reason
+    return request_json(path, payload=payload, pages=paginated, timeout=min(30, remaining()))
 
 
 def check_target(run, remaining):
@@ -207,21 +130,6 @@ def review_payload(submission, run, root, remaining):
 
 
 def verify_completion(context, run, remaining, *, submit=False, submission=None):
-    try:
-        return _verify_completion(context, run, remaining, submit=submit, submission=submission)
-    except GitHubAPIError as error:
-        diagnostic = dict(error.details, recorded_at=datetime.now(timezone.utc).isoformat(),
-                          repository=run["repository"], pr_number=run["pr_number"],
-                          head_sha=run["head_sha"], base_sha=run["base_sha"])
-        # Append rather than replace: later readback failures must not erase the
-        # original POST response. Neither this log nor the intent proves delivery.
-        with (context / API_ERRORS_FILE).open("a") as handle:
-            handle.write(json.dumps(diagnostic) + "\n")
-        print(f"Review API diagnostic: {json.dumps(diagnostic)}", file=sys.stderr, flush=True)
-        raise
-
-
-def _verify_completion(context, run, remaining, *, submit=False, submission=None):
     """Never infer completion from an unowned review or a local result file."""
     path = context / SUBMISSION_FILE
     if submission is None:
@@ -248,9 +156,7 @@ def _verify_completion(context, run, remaining, *, submit=False, submission=None
             write_json(context / REJECTION_FILE, {"reason": reason, "submission": submission})
             raise ValueError(reason)
         if path.exists():
-            raise ValueError(with_api_failure(
-                context, "Final submission was attempted but cannot be verified; refusing to repost"
-            ))
+            raise ValueError("Final submission was attempted but cannot be verified; refusing to repost")
         # Persist the complete intent before POST: if the response is lost, the
         # runner can read back this exact review without repeating the write.
         # Exclusive creation also prevents two accidental simultaneous helper
@@ -261,9 +167,7 @@ def _verify_completion(context, run, remaining, *, submit=False, submission=None
         matching = [r for r in api(f"{root}/reviews", remaining, paginated=True)
                     if marker in (r.get("body") or "")]
     if len(matching) != 1:
-        raise ValueError(with_api_failure(
-            context, "Could not verify exactly one final review from this invocation"
-        ))
+        raise ValueError("Could not verify exactly one final review from this invocation")
     review = matching[0]
     expected_state = "CHANGES_REQUESTED" if payload["event"] == "REQUEST_CHANGES" else "COMMENTED"
     if (review.get("user", {}).get("login") != run["review_author"]

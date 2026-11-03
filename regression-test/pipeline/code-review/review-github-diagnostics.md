@@ -1,36 +1,11 @@
-# GitHub request diagnostics for code review
+# GitHub request diagnostics
 
-The review and status workers import `lib/review_github_api.py` from the
-independent trusted master checkout. PR code is checked out into a separate
-private workspace. The submission helper and head watchdog use the same
-trusted module.
+All review workers and submission helpers use `request_json` from the trusted
+controller checkout. Failures retain the exit status, HTTP status, request ID,
+rate-limit headers and bounded response excerpts in `--artifacts-dir/github-api`.
+`GH_DEBUG=api` is captured in memory; request headers/body are discarded, and
+response excerpts are redacted before truncation. Each failure has its own file.
 
-Python helpers use run_gh with captured text output, check=True and their timeout;
-use decode_json when decoding its result. Request arguments, normal stdout,
-write deduplication, permission decisions and retry policy remain unchanged.
-
-On a failure, the helper prints a short diagnostic and saves one JSON record
-under REVIEW_GITHUB_DIAGNOSTICS_DIR. Records include the command exit status or
-timeout, the last HTTP method/path/status, GitHub request ID, rate-limit and
-retry headers, gh version, and bounded response/stdout/stderr excerpts. A
-successful gh exit followed by a Python JSON decode error is also recorded.
-A transport failure without a response has status: null; it is not inferred
-to be an HTTP error.
-
-The helper captures GH_DEBUG=api in memory because gh can discard a malformed
-error body and its HTTP status while parsing it. Outgoing headers, request
-bodies and argv are never archived. Response headers use an allowlist.
-Credential values and common credential fields are redacted before excerpts
-are truncated. The response body is gh's formatted debug excerpt, not exact
-wire bytes; gh may itself limit or omit it. Debug format changes may leave
-fields unavailable. Hard termination of the helper can prevent recording.
-
-Each failure uses a separate file so later cleanup errors do not overwrite it.
-The CLI writes diagnostics under `--artifacts-dir/github-api`, outside the
-private workspace, including when an optional operation catches an API failure.
-TeamCity's artifact rule publishes `review-artifacts/**` as `review-diagnostics`.
-The endpoint identifies the current or previous head. Diagnostic storage
-failures do not replace the original request failure.
-
-Submission evidence is retained under `--artifacts-dir/review`. Neither
-credential files nor the full CODEX_HOME are published as build artifacts.
+Submission intent and rejected candidates are retained under `--artifacts-dir/review`.
+TeamCity publishes `review-artifacts/**`; credentials and private workspaces are excluded.
+Diagnostic storage failures do not replace the original request failure.

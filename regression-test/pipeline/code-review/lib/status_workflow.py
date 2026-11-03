@@ -15,140 +15,206 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Source statuses and SHA-wide aggregation are separate workflow operations."""
+"""Validate review sources and aggregate the status of every open PR on a SHA."""
 
 import fnmatch
 import logging
+import re
 import subprocess
+from datetime import datetime, timedelta
 
-from resolve_code_review_status import resolve_status
+from process import require, require_full_sha
 from review_github_api import redact
-from validate_review_pass_comment import parse_comment, require_full_sha, validate_comment
+
+FIELDS = 'schema status pr commit base reviewed_at reviewer model effort findings rounds converged'.split()
+BEGIN, END = '<!-- doris-repo-review:v1:begin -->', '<!-- doris-repo-review:v1:end -->'
+EFFORTS = {
+    **{model + suffix: {'xhigh', 'max'} for model in ('claude-opus-5-5', 'claude-fable-5', 'claude-fable-5-1')
+       for suffix in ('', '[1m]')},
+    **{model: {'xhigh', 'max', 'ultra'} for model in ('gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-astra')},
+}
+SOURCE = re.compile(r'code-review/source/(automated|local|skip)/pr-(\d+)/base-([0-9a-fA-F]{40})')
+
+
+def parse_comment(comment):
+    require(comment.count(BEGIN) == comment.count(END) == 1, 'Expected one review marker pair')
+    require(comment.index(BEGIN) < comment.index(END), 'Review markers are out of order')
+    blocks = re.findall(r'```yaml\n(.*?)\n```', comment.split(BEGIN)[1].split(END)[0], flags=re.DOTALL)
+    require(len(blocks) == 1, 'Expected one fenced yaml block')
+    rows = [(key.strip(), value.strip()) for key, value in (line.split(':', 1) for line in blocks[0].splitlines())]
+    require([key for key, _ in rows] == FIELDS, 'Comment fields do not match the v1 schema')
+    fields = dict(rows)
+    findings = re.fullmatch(r'\{blocker: (\d+), major: (\d+), minor: (\d+), nit: (\d+)\}', fields['findings'])
+    require(findings is not None, 'Findings must use the v1 inline-map format')
+    fields['findings'] = tuple(map(int, findings.groups()))
+    fields['rounds'] = int(fields['rounds'])
+    return fields
+
+
+def timestamp(value):
+    parsed = datetime.fromisoformat(value)
+    require(parsed.utcoffset() is not None, 'Timestamp must include a timezone offset')
+    return parsed
+
+
+def validate_comment(fields, repository, number, head, base, author):
+    for name, value in (('commit', fields['commit']), ('base', fields['base']), ('live base', base)):
+        require_full_sha(name, value)
+    checks = (
+        (fields['schema'] == 'doris-repo-review/v1', 'Unsupported review schema'),
+        (fields['status'] == 'PASS', 'Review status is not PASS'),
+        (fields['pr'].casefold() == f'{repository}#{number}'.casefold(), 'Review targets another PR'),
+        (fields['commit'].casefold() == head.casefold(), 'Review targets another head'),
+        (fields['reviewer'].casefold() == author.casefold(), 'Reviewer does not match comment creator'),
+        (fields['effort'] in EFFORTS.get(fields['model'], set()), 'Model/effort is not allowed'),
+        (fields['findings'][:2] == (0, 0), 'Blocker and Major findings must be zero'),
+        (fields['converged'] == 'true', 'Review did not converge'),
+        (1 <= fields['rounds'] <= 3, 'Rounds must be between 1 and 3'),
+    )
+    for valid, message in checks:
+        require(valid, message)
+    timestamp(fields['reviewed_at'])
+
+
+def resolve_status(pulls, statuses, head):
+    require_full_sha('head', head)
+    contexts = set()
+    for pr in pulls:
+        if pr['state'] == 'open' and pr['head']['sha'].casefold() == head.casefold():
+            require_full_sha('base', pr['base']['sha'])
+            contexts.add((pr['number'], pr['base']['sha'].casefold()))
+    if not contexts:
+        return 'pending', f'No open pull request currently uses {head[:12]}.'
+    latest = {item['context']: item for item in sorted(statuses, key=lambda item: item['id'])}
+    approved, blocked, incomplete = set(), set(), set()
+    for context, item in latest.items():
+        match = SOURCE.fullmatch(context)
+        if match is None:
+            continue
+        kind, number, base = match.groups()
+        key = (int(number), base.casefold())
+        if item['state'] == 'success':
+            approved.add(key)
+        elif kind == 'automated' and item['state'] == 'failure':
+            blocked.add(key)
+            if (item.get('description') or '').startswith('Review did not converge after '):
+                incomplete.add(key)
+    missing = contexts - approved  # Authorized local PASS/skip still overrides an automated failure.
+    failures = sorted(missing & blocked)
+    if failures:
+        number, base = failures[0]
+        reason = 'did not converge' if (number, base) in incomplete else 'completed with P0/P1'
+        return 'failure', f'Review {reason} for PR #{number} at {base[:12]}.'
+    if missing:
+        number, base = min(missing)
+        suffix = f' (+{len(missing) - 1} more)' if len(missing) > 1 else ''
+        return 'pending', f'Awaiting code review for PR #{number} at {base[:12]}{suffix}.'
+    noun = 'context' if len(contexts) == 1 else 'contexts'
+    return 'success', f'Code review passed for {len(contexts)} open PR {noun} on {head[:12]}.'
 
 
 class StatusWorkflow:
     def __init__(self, github, *, run_url, skip_policy):
-        self.github = github
-        self.run_url = run_url
-        self.skip_policy = skip_policy
+        self.github, self.run_url, self.skip_policy = github, run_url, skip_policy
 
     @staticmethod
     def source(kind, number, base):
-        return f"code-review/source/{kind}/pr-{number}/base-{base}"
+        return f'code-review/source/{kind}/pr-{number}/base-{base}'
+
+    def publish(self, head, state, description, *, context='code-review', url=None):
+        return self.github.status(head, context, state, description, url or self.run_url)
 
     def aggregate(self, head):
-        self.github.status(head, "code-review", "pending",
-                           f"Recalculating code review for {head[:12]}.", self.run_url)
-        pulls = self.github.api("pulls?state=open&per_page=100", pages=True)
-        statuses = self.github.api(f"commits/{head}/statuses?per_page=100", pages=True)
-        resolution = resolve_status(pulls, statuses, head_sha=head)
-        self.github.status(head, "code-review", resolution.state,
-                           resolution.description, self.run_url)
-        return resolution
+        self.publish(head, 'pending', f'Recalculating code review for {head[:12]}.')
+        pulls = self.github.api('pulls?state=open&per_page=100', pages=True)
+        statuses = self.github.api(f'commits/{head}/statuses?per_page=100', pages=True)
+        state, description = resolve_status(pulls, statuses, head)
+        self.publish(head, state, description)
 
     def begin_review(self, number, head, base):
-        self.github.status(head, "code-review", "pending",
-                           f"Automated review is running for PR #{number}.", self.run_url)
-        self.github.status(head, self.source("automated", number, base), "pending",
-                           f"Automated review is running for PR #{number} at {base[:12]}.",
-                           self.run_url)
+        self.publish(head, 'pending', f'Automated review is running for PR #{number}.')
+        self.publish(head, 'pending', f'Automated review is running for PR #{number} at {base[:12]}.',
+                     context=self.source('automated', number, base))
 
     def finish_review(self, number, head, base, *, result, execution_succeeded):
-        state = "pending"
-        description = f"Automated review did not pass for PR #{number} at {base[:12]}."
+        state = 'pending'
+        description = f'Automated review did not pass for PR #{number} at {base[:12]}.'
         if execution_succeeded:
-            state = result["state"]
-            if state not in {"success", "failure"}:
-                raise ValueError("Missing verified review verdict")
+            state = result['state']
+            require(state in {'success', 'failure'}, 'Missing verified review verdict')
             description = f"Review completed for PR #{number}: P0={result['p0']}, P1={result['p1']}."
-            if not result["converged"]:
+            if not result['converged']:
                 description = (f"Review did not converge after {result['rounds']} rounds "
                                f"for PR #{number}: P0={result['p0']}, P1={result['p1']}.")
-        self.github.status(head, self.source("automated", number, base),
-                           state, description, self.run_url)
+        self.publish(head, state, description, context=self.source('automated', number, base))
 
-    def _approve(self, kind, number, head, base, description, url):
-        self.github.status(head, "code-review", "pending",
-                           f"Recalculating code review for PR #{number}.", url)
-        self.github.status(head, self.source(kind, number, base), "success", description, url)
-        return self.aggregate(head)
+    def approve(self, kind, number, head, base, description, url):
+        self.publish(head, 'pending', f'Recalculating code review for PR #{number}.', url=url)
+        self.publish(head, 'success', description, context=self.source(kind, number, base), url=url)
+        self.aggregate(head)
 
     def accept_local(self, event):
         comment = event.comment
-        author = comment["user"]["login"]
-        if author != event.data["sender"]["login"]:
-            logging.info("Ignoring local PASS: comment creator and sender differ")
+        author = comment['user']['login']
+        if author != event.data['sender']['login']:
+            logging.info('Ignoring local PASS: comment creator and sender differ')
             return
         try:
-            permission = self.github.api(f"collaborators/{author}/permission")["permission"]
+            permission = self.github.api(f'collaborators/{author}/permission')['permission']
+            require(permission in {'write', 'admin'}, 'Comment creator needs write permission')
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
-            logging.warning("Ignoring local PASS: cannot verify repository permission (%s)",
-                            type(error).__name__)
-            return
-        if permission not in {"write", "admin"}:
-            logging.info("Ignoring local PASS: creator does not have write permission")
+            logging.info('Ignoring local PASS: %s', redact(str(error)))
             return
         number = event.pr_number
         pr = self.github.pull(number)
-        if pr["state"] != "open":
-            logging.info("Ignoring local PASS: pull request is %s", pr["state"])
-            return
-        head, base = pr["head"]["sha"], pr["base"]["sha"]
         try:
-            fields = parse_comment(comment["body"])
-            reviewed_base = str(fields["base"])
-            # validate_comment checks the snapshot's identity, model and convergence.
-            require_full_sha("reviewed base", reviewed_base)
-            comparison = self.github.api(f"compare/{reviewed_base}...{base}")["status"]
-            reviewed_time = live_time = None
-            if reviewed_base != base:
-                reviewed_time = self.github.api(f"commits/{reviewed_base}")["commit"]["committer"]["date"]
-                live_time = self.github.api(f"commits/{base}")["commit"]["committer"]["date"]
-            validate_comment(
-                comment["body"], repository=self.github.repository, pr_number=number,
-                head_sha=head, live_base_sha=base, base_compare_status=comparison,
-                reviewed_base_committed_at=reviewed_time, live_base_committed_at=live_time,
-                comment_author=author, comment_author_permission=permission,
-            )
+            require(pr['state'] == 'open', 'PR is not open')
+            head, base = pr['head']['sha'], pr['base']['sha']
+            fields = parse_comment(comment['body'])
+            validate_comment(fields, self.github.repository, number, head, base, author)
+            reviewed = fields['base']
+            comparison = self.github.api(f'compare/{reviewed}...{base}')['status']
+            if reviewed.casefold() == base.casefold():
+                require(comparison == 'identical', 'Equal bases must have compare status identical')
+            else:
+                require(comparison == 'ahead', 'Reviewed base is not an ancestor of the current base')
+                times = [timestamp(self.github.api(f'commits/{sha}')['commit']['committer']['date'])
+                         for sha in (reviewed, base)]
+                require(timedelta(0) <= times[1] - times[0] <= timedelta(hours=48),
+                        'Reviewed base must be within 48 hours of the current base')
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
-            logging.info("Ignoring local PASS: validation failed (%s)", type(error).__name__)
+            logging.info('Ignoring local PASS: %s', redact(str(error)))
             return
-        return self._approve("local", number, head, base,
-                             f"Local review passed for PR #{number} at {base[:12]}.",
-                             comment["html_url"])
+        self.approve('local', number, head, base, f'Local review passed for PR #{number} at {base[:12]}.',
+                     comment['html_url'])
 
     def skip_review(self, event):
         number = event.pr_number
         pr = self.github.pull(number)
-        user = str(event.comment["user"]["id"])
-        branch = pr["base"]["ref"]
-        allowed = user in self.skip_policy["all_branches"] or any(
+        user, branch = str(event.comment['user']['id']), pr['base']['ref']
+        allowed = user in self.skip_policy['all_branches'] or any(
             fnmatch.fnmatchcase(branch, pattern) and user in users
-            for pattern, users in self.skip_policy["branches"].items()
-        )
+            for pattern, users in self.skip_policy['branches'].items())
         if not allowed:
-            logging.info("Ignoring skip: user is not allowed for this target branch")
+            logging.info('Ignoring skip: user is not allowed for this target branch')
             return
-        head, base = pr["head"]["sha"], pr["base"]["sha"]
-        return self._approve("skip", number, head, base,
-                             f"Code review skipped for PR #{number} at {base[:12]}.", self.run_url)
+        head, base = pr['head']['sha'], pr['base']['sha']
+        self.approve('skip', number, head, base, f'Code review skipped for PR #{number} at {base[:12]}.',
+                     self.run_url)
 
     def synchronize(self, event):
-        # These used to be independent jobs. One failure must not suppress the
-        # other valid event handlers, particularly old-head recomputation.
         actions = []
         if event.local_pass:
-            actions.append(lambda: self.accept_local(event))
+            actions.append((self.accept_local, event))
         if event.skip:
-            actions.append(lambda: self.skip_review(event))
-        for head in event.status_heads:
-            actions.append(lambda head=head: self.aggregate(head))
+            actions.append((self.skip_review, event))
+        actions.extend((self.aggregate, head) for head in event.status_heads)
         failures = []
-        for action in actions:
+        for operation, argument in actions:
             try:
-                action()
+                operation(argument)
             except (OSError, ValueError, subprocess.SubprocessError) as error:
-                logging.error("Status synchronization failed (%s): %s", type(error).__name__, redact(str(error)))
+                logging.error("Status synchronization failed: %s", redact(str(error)))
                 failures.append(error)
         if failures:
             raise RuntimeError(f"{len(failures)} status synchronization operation(s) failed") from failures[0]

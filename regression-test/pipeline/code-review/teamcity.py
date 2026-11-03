@@ -27,11 +27,11 @@ No PR revision/path or script is accepted from the forwarded event.
 import base64
 import json
 import os
-from pathlib import Path
 import signal
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 
 def main():
@@ -56,8 +56,9 @@ def main():
         event = json.loads(base64.b64decode(encoded, validate=True))
         event_path = directory / "event.json"
         event_path.write_text(json.dumps(event))
-        sys.path.insert(0, str(controller / "lib"))
-        from events import Event
+        sys.path.insert(0, str(controller))
+        from main import Event
+        from main import main as worker
         parsed = Event(os.environ["REVIEW_EVENT_NAME"], event)
         # A filtered event needs no service credentials. Canary uses OSS only.
         if mode == "review" and not (parsed.review or parsed.canary):
@@ -89,7 +90,6 @@ def main():
             arguments.extend(["--trusted-revision", revision])
         # Import from the trusted checkout so cancellation always unwinds the
         # worker's finalizers before this adapter deletes its secret files.
-        from cli import main as worker
         return worker([mode, *arguments])
 
 

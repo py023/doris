@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -16,8 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Capture gh HTTP failures without changing stdout, exit status, or retry policy."""
-
 import json
 import os
 import re
@@ -30,8 +27,12 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 LIMIT = 65536
+
+
 SECRET_FIELD = (r"(?:access_token|refresh_token|id_token|token|api_key|secret|"
                 r"client_secret|password|authorization|cookie|set-cookie)")
+
+
 HEADERS = {
     "content-type", "content-length", "date", "x-github-request-id",
     "retry-after", "x-ratelimit-limit", "x-ratelimit-remaining",
@@ -59,16 +60,6 @@ def redact(value):
     return value
 
 
-def redact_json(value):
-    """Redact decoded JSON before serialization so quotes cannot break artifacts."""
-    if isinstance(value, dict):
-        return {redact(key): "[REDACTED]" if re.fullmatch(SECRET_FIELD, key, re.IGNORECASE)
-                else redact_json(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [redact_json(item) for item in value]
-    return redact(value) if isinstance(value, str) else value
-
-
 def excerpt(value):
     value = redact(value)
     return value[:LIMIT] + ("\n[truncated]" if len(value) > LIMIT else "")
@@ -87,15 +78,12 @@ def split_trace(stderr):
     ordinary = []
     mode = "ordinary"
     body = []
-    body_chars = 0
     for line in text.splitlines():
         if line.startswith("* Request at "):
             count = response["request_count"] + 1
             response = {**response, "method": None, "path": None, "status": None,
                         "headers": {}, "body_excerpt": "", "request_count": count}
             body = []
-            body_chars = 0
-            response.pop("body_truncated", None)
             mode = "request"
         elif line.startswith("> "):
             match = re.match(r"> ([A-Z]+) (\S+) HTTP/", line)
@@ -107,7 +95,6 @@ def split_trace(stderr):
             response["status"] = int(line.split()[2])
             response["headers"] = {}
             body = []
-            body_chars = 0
             mode = "headers"
         elif mode == "headers" and line.startswith("< "):
             name, sep, value = line[2:].partition(":")
@@ -118,17 +105,11 @@ def split_trace(stderr):
         elif mode == "headers" and not line:
             mode = "body"
         elif mode == "body":
-            # Bound retained response content even if debug output grows.
-            line = redact(line)  # Redact before truncation can split a secret.
-            if body_chars < LIMIT:
-                response["body_truncated"] = len(line) + body_chars > LIMIT
-                body.append(line[:LIMIT - body_chars])
-                body_chars += len(line) + 1
-            else:
-                response["body_truncated"] = True
+            body.append(line)
         elif mode == "ordinary" and not line.startswith("* "):
             ordinary.append(line)
     response["body_excerpt"] = excerpt("\n".join(body).strip())
+    response["body_truncated"] = len("\n".join(body).strip()) > LIMIT
     if mode == "request":
         # A transport failure has no response; do not mistake request data for
         # its body. subprocess timeout/type still identifies the failure.
@@ -175,51 +156,50 @@ def record_failure(command, error, stdout="", stderr="", *, diagnostic=None):
     return ordinary, record
 
 
-def run_gh(command, **kwargs):
-    """subprocess.run contract for captured text gh calls, with failure evidence."""
-    env = dict(kwargs.pop("env", os.environ))
-    env.update(GH_DEBUG="api", NO_COLOR="1")
+def request_json(path, *, payload=None, pages=False, env=None, timeout=None):
+    command = ["gh", "api", path]
+    if pages:
+        command += ["--paginate", "--slurp"]
+    if payload is not None:
+        command += ["--method", "POST", "--input", "-"]
+    environment = {**(os.environ if env is None else env), "GH_DEBUG": "api", "NO_COLOR": "1"}
     try:
-        result = subprocess.run(command, env=env, **kwargs)
+        result = subprocess.run(command, env=environment, timeout=timeout, text=True, check=True,
+                                capture_output=True, input=None if payload is None else json.dumps(payload))
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
         ordinary, record = record_failure(command, error, error.stdout, error.stderr)
         error.stderr = ordinary + "\n" + record["summary"]
-        # Preserve the original return code/timeout and stdout for callers.
         raise
     except OSError as error:
         record_failure(command, error)
         raise
     response, ordinary = split_trace(result.stderr)
-    result.stderr = ordinary
-    result.github_response = response
-    return result
-
-
-def decode_json(result, command):
     try:
-        return json.loads(result.stdout)
+        data = json.loads(result.stdout)
     except json.JSONDecodeError as error:
-        record_failure(command, error, result.stdout, result.stderr,
-                       diagnostic=result.github_response)
+        record_failure(command, error, result.stdout, ordinary, diagnostic=response)
         raise
+    return [item for page in data for item in page] if pages else data
 
 
-def main():
-    command = ["gh", *sys.argv[1:]]
-    try:
-        result = run_gh(command, capture_output=True, text=True, check=True)
-    except subprocess.CalledProcessError as error:
-        sys.stdout.write(error.stdout or "")
-        print(error.stderr, file=sys.stderr)
-        return error.returncode if error.returncode >= 0 else 128 - error.returncode
-    except OSError as error:
-        print(f"Could not execute gh ({type(error).__name__})", file=sys.stderr)
-        return 1
-    sys.stdout.write(result.stdout)
-    if result.stderr:
-        print(result.stderr, file=sys.stderr)
-    return 0
+class GitHub:
+    def __init__(self, repository, *, env, timeout):
+        self.repository = repository
+        self.env = env
+        self.timeout = timeout
 
+    def api(self, path, *, payload=None, pages=False):
+        return request_json(f"repos/{self.repository}/{path}", payload=payload, pages=pages,
+                            env=self.env, timeout=self.timeout)
 
-if __name__ == "__main__":
-    sys.exit(main())
+    def pull(self, number):
+        return self.api(f"pulls/{number}")
+
+    def status(self, head, context, state, description, url):
+        return self.api(f"statuses/{head}", payload={
+            "context": context, "state": state,
+            "description": description, "target_url": url,
+        })
+
+    def comment(self, number, body):
+        return self.api(f"issues/{number}/comments", payload={"body": body})
