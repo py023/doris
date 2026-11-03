@@ -297,7 +297,9 @@ class Runtime:
                 shutil.copyfile(context / file_name, output / file_name)
 
     def telemetry(self, context, home, target):
-        if not self.options.telemetry_url:
+        # Telemetry is optional: it is off until both Langfuse keys are configured.
+        if not (self.options.telemetry_url and self.env.get("LANGFUSE_PUBLIC_KEY")
+                and self.env.get("LANGFUSE_SECRET_KEY")):
             return
         if not all((context / file_name).is_file() and (context / file_name).stat().st_size
                    for file_name in ("codex_goal_prompt.txt", "codex-events.jsonl")):

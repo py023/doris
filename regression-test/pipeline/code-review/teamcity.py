@@ -16,12 +16,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""TeamCity adapter. Can also be pasted into Python -> Custom script.
+"""TeamCity entry point: `python3 teamcity.py review|sync`, as configured in settings.kts.
 
-Prerequisites: trusted master checkout; Linux agents with Python 3.11+, git, gh,
-rg, and ossutil 1.7.19. Configure Parameters as listed in settings.kts.
-Pass review or sync and the business CLI flags in Script arguments.
-No PR revision/path or script is accepted from the forwarded event.
+It runs from the build's agent-side checkout of master, decodes the event that
+`main.py forward` queued, stages the env.REVIEW_* credentials as private files and
+runs the worker. Agents need Linux, Python 3.11+, git and gh; review agents also
+need rg and ossutil 1.7.19. No PR revision, path or script is accepted from the event.
 """
 
 import base64
@@ -33,14 +33,24 @@ import sys
 import tempfile
 from pathlib import Path
 
+CONTROLLER = Path(__file__).resolve().parent
+# Credential variable -> (worker flag, the runs that use it). Telemetry keys are optional.
+CREDENTIALS = {
+    "REVIEW_GITHUB_TOKEN": ("--github-token-file", {"review", "sync"}),
+    "REVIEW_OSS_ACCESS_KEY": ("--oss-access-key-file", {"review", "canary"}),
+    "REVIEW_OSS_SECRET_KEY": ("--oss-secret-key-file", {"review", "canary"}),
+    "REVIEW_TELEMETRY_PUBLIC_KEY": ("--telemetry-public-key-file", {"review"}),
+    "REVIEW_TELEMETRY_SECRET_KEY": ("--telemetry-secret-key-file", {"review"}),
+}
+OPTIONAL = {"REVIEW_TELEMETRY_PUBLIC_KEY", "REVIEW_TELEMETRY_SECRET_KEY"}
+
 
 def main():
-    # FIXME: Set REVIEW_CONTROLLER_DIR to the independently checked-out master
-    # directory (regression-test/pipeline/code-review); never the PR checkout.
-    controller = Path(os.environ["REVIEW_CONTROLLER_DIR"]).resolve()
-    sys.path.insert(0, str(controller))
-    # Import from the trusted checkout so cancellation always unwinds the
-    # worker's finalizers before this adapter deletes its secret files.
+    if sys.version_info < (3, 11):
+        raise RuntimeError("The review controller requires Python 3.11 or newer")
+    sys.path.insert(0, str(CONTROLLER))
+    # Import the worker from this trusted checkout; running it in-process lets
+    # cancellation unwind its finalizers before the credential files are deleted.
     from main import MAX_EVENT_PARTS, Event, cancel
     from main import main as worker
     mode, *arguments = sys.argv[1:]
@@ -48,43 +58,36 @@ def main():
         raise ValueError("Expected review or sync")
     os.umask(0o077)
     signal.signal(signal.SIGTERM, cancel)
+    # No credential stays in the environment that the worker and Codex inherit.
+    credentials = {variable: os.environ.pop(variable, "") for variable in CREDENTIALS}
     count = int(os.environ["REVIEW_EVENT_PARTS"])
     if not 0 < count <= MAX_EVENT_PARTS:
-        raise ValueError("Invalid number of event chunks")
+        raise ValueError("Invalid number of event chunks; was this build queued by main.py forward?")
     encoded = "".join(os.environ[f"REVIEW_EVENT_{index:04d}"] for index in range(count))
     event = json.loads(base64.b64decode(encoded, validate=True))
     parsed = Event(os.environ["REVIEW_EVENT_NAME"], event)
-    # A filtered event needs no service credentials. Canary uses OSS only.
     if not parsed.wanted(mode):
         return 0
-    with tempfile.TemporaryDirectory(prefix="review-input-", dir=os.environ.get("REVIEW_TEMP_DIR")) as temporary:
+    run = "canary" if parsed.canary else mode
+    with tempfile.TemporaryDirectory(prefix="review-input-") as temporary:
         directory = Path(temporary)
         event_path = directory / "event.json"
         event_path.write_text(json.dumps(event))
-        arguments.extend(["--temp-dir", str(directory)])
-        secrets = [] if parsed.canary else [("REVIEW_GITHUB_TOKEN", "--github-token-file")]
-        if mode == "review":
-            secrets += [("REVIEW_OSS_ACCESS_KEY", "--oss-access-key-file"),
-                        ("REVIEW_OSS_SECRET_KEY", "--oss-secret-key-file")]
-            for variable, flag in (("REVIEW_TELEMETRY_PUBLIC_KEY", "--telemetry-public-key-file"),
-                                   ("REVIEW_TELEMETRY_SECRET_KEY", "--telemetry-secret-key-file")):
-                if not parsed.canary and os.environ.get(variable):
-                    secrets.append((variable, flag))
-        for variable, flag in secrets:
-            secret_path = directory / variable.lower()
-            secret_path.write_text(os.environ.pop(variable))
-            secret_path.chmod(0o600)
-            arguments.extend([flag, str(secret_path)])
-        # Unused canary credentials must not remain in Codex's environment.
-        for variable in ("REVIEW_GITHUB_TOKEN", "REVIEW_TELEMETRY_PUBLIC_KEY", "REVIEW_TELEMETRY_SECRET_KEY"):
-            os.environ.pop(variable, None)
-        arguments.extend(["--event-file", str(event_path), "--event-name", os.environ["REVIEW_EVENT_NAME"],
-                          "--request-id", os.environ["REVIEW_REQUEST_ID"],
-                          "--run-id", os.environ["REVIEW_BUILD_ID"], "--run-url", os.environ["REVIEW_BUILD_URL"]])
-        if mode == "review" and not parsed.canary:
-            revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=controller, text=True).strip()
-            arguments.extend(["--trusted-revision", revision])
+        arguments += ["--temp-dir", str(directory), "--event-file", str(event_path),
+                      "--event-name", os.environ["REVIEW_EVENT_NAME"], "--request-id", os.environ["REVIEW_REQUEST_ID"],
+                      "--run-id", os.environ["REVIEW_BUILD_ID"], "--run-url", os.environ["REVIEW_BUILD_URL"]]
+        for variable, (flag, runs) in CREDENTIALS.items():
+            if run not in runs or (variable in OPTIONAL and not credentials[variable]):
+                continue
+            path = directory / variable.lower()  # An empty required credential is rejected by the worker.
+            path.write_text(credentials[variable])
+            path.chmod(0o600)
+            arguments += [flag, str(path)]
+        if run == "review":
+            revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=CONTROLLER, text=True).strip()
+            arguments += ["--trusted-revision", revision]
         return worker([mode, *arguments])
+
 
 if __name__ == "__main__":
     sys.exit(main())

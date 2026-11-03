@@ -38,7 +38,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "lib"))
 
 from process import Workspace, boolean, log_failure, sh, step
-from review_github_api import GitHub
+from review_github_api import GitHub, request_json
 from review_runtime import AuthPool, ObjectStore, Runtime
 from review_workflow import ReviewWorkflow
 from status_workflow import BEGIN as LOCAL_REVIEW_MARKER
@@ -48,6 +48,27 @@ PR_EVENTS = {"opened", "synchronize", "reopened", "ready_for_review", "edited", 
 REVIEW_ASSOCIATIONS = {"MEMBER", "OWNER", "COLLABORATOR"}
 REVIEW_COMMAND = re.compile(r"/review(?=\s|$)", re.IGNORECASE)
 MAX_EVENT_PARTS = 128
+# Deployment configuration. TeamCity passes none of it, so it changes only through a PR here.
+REPOSITORY = "apache/doris"
+OSS = "oss://doris-community-ci"
+REVIEW_DEFAULTS = {
+    "repository-url": f"https://github.com/{REPOSITORY}.git",
+    "model": "gpt-6.1-sol", "fallback-model": "gpt-6-sol", "effort": "xhigh",
+    "oss-endpoint": "https://oss-cn-hongkong.aliyuncs.com",
+    "auth-prefix": f"{OSS}/codex/auth.json.",
+    "canary-auth-object": f"{OSS}/codex/auth.json.4",
+    "codex-package": f"{OSS}/codex/releases/codex-exec-goal-0.162.1-3547e9086675-x86_64-unknown-linux-gnu.tar.gz",
+    "codex-checksum": "51304e4f9c343ae84e00a304344df41c2fd32821c83bdbf5be68b0f0c25ddae1",
+    "codex-version": "0.162.1",
+    "codex-binary-checksum": "a0d5ec053074d66570aa967129d350541f344f76671a199b5a7bc0d45366cdf7",
+    "memories-object": f"{OSS}/memories.tar.gz",
+    "sessions-prefix": f"{OSS}/session",
+    "telemetry-url": "https://litefuse.cloud",
+    # Empty review-author means the login that owns the GitHub token.
+    "review-author": "", "trusted-revision": "", "ossutil": "ossutil", "environment": "teamcity",
+    "trace-name": "doris-ai-review", "subagent-trace-name": "doris-ai-review-subagent",
+    "workflow-name": "Code Review Runner",
+}
 GITHUB_ENV = {"GH_TOKEN", "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "REVIEW_GITHUB_DIAGNOSTICS_DIR",
               "GITHUB_RUN_ID", "GITHUB_JOB", "REVIEW_GH_VERSION"}
 
@@ -117,11 +138,11 @@ class Event:
         before = self.data.get("before")
         return [head, before] if self.data["action"] == "synchronize" and before and before != head else [head]
 
-    def wanted(self, mode=None):
-        """Whether the review or sync worker acts on this event; None asks whether either does."""
-        review = self.review or self.canary
-        sync = self.local_pass or self.skip or bool(self.status_heads)
-        return {"review": review, "sync": sync, None: review or sync}[mode]
+    def wanted(self, mode):
+        """Whether the review or the sync worker acts on this event."""
+        if mode == "review":
+            return self.review or self.canary
+        return self.local_pass or self.skip or bool(self.status_heads)
 
 
 def event_snapshot(event):
@@ -147,7 +168,7 @@ def event_snapshot(event):
     return result
 
 
-def build_request(event, *, event_name, build_type, request_id, origin_url, chunk_size):
+def build_request(event, *, event_name, build_type, request_id, chunk_size):
     encoded = base64.b64encode(json.dumps(event_snapshot(event), ensure_ascii=False).encode()).decode("ascii")
     chunks = [encoded[index:index + chunk_size] for index in range(0, len(encoded), chunk_size)]
     if len(chunks) > MAX_EVENT_PARTS:
@@ -155,7 +176,6 @@ def build_request(event, *, event_name, build_type, request_id, origin_url, chun
     properties = {
         "env.REVIEW_EVENT_NAME": event_name,
         "env.REVIEW_REQUEST_ID": request_id,
-        "env.REVIEW_ORIGIN_URL": origin_url,
         "env.REVIEW_EVENT_PARTS": str(len(chunks)),
         **{f"env.REVIEW_EVENT_{index:04d}": chunk for index, chunk in enumerate(chunks)},
     }
@@ -182,15 +202,14 @@ def enqueue(server, token, payload, *, timeout):
 
 def forward(options):
     event = json.loads(options.event_file.read_text())
-    # Most comments concern neither worker; filtering here keeps them off the review agents.
-    if not Event(options.event_name, event).wanted():
-        logging.info("Event concerns neither code review worker; nothing to enqueue")
+    # Filtering here keeps comments that the target build ignores off its agents.
+    if not Event(options.event_name, event).wanted(options.mode):
+        logging.info("Event needs no %s work; nothing to enqueue", options.mode)
         return 0
     payload = build_request(event, event_name=options.event_name, build_type=options.teamcity_build_type,
-                            request_id=options.request_id, origin_url=options.origin_url,
-                            chunk_size=options.event_chunk_size)
+                            request_id=options.request_id, chunk_size=options.event_chunk_size)
     # The token comes from the environment so that it never appears in argv.
-    token = secret_text(os.environ.pop("TEAMCITY_TOKEN", ""))
+    token = secret_text(os.environ.pop("TEAMCITY_TOKEN", ""), "TEAMCITY_TOKEN")
     enqueue(options.teamcity_url, token, payload, timeout=options.http_timeout)
     return 0
 
@@ -202,15 +221,15 @@ def positive(value):
     return result
 
 
-def secret_text(value):
+def secret_text(value, name):
     value = value.rstrip("\r\n")
     if not value or "\n" in value or "\r" in value:
-        raise ValueError("A credential must be one nonempty line of text")
+        raise ValueError(f"Credential {name} must be one nonempty line of text")
     return value
 
 
 def read_secret(path):
-    return secret_text(Path(path).read_text())
+    return secret_text(Path(path).read_text(), Path(path).name)
 
 
 def parser():
@@ -225,35 +244,31 @@ def parser():
             target.add_argument("--" + name, **config)
 
     add(forward_command, "event-file", type=Path, required=True)
-    add(forward_command, "event-name request-id origin-url teamcity-url teamcity-build-type", required=True)
+    add(forward_command, "event-name request-id teamcity-url teamcity-build-type", required=True)
+    forward_command.add_argument("--mode", choices=("review", "sync"), required=True,
+                                 help="Worker of the target build type")
     add(forward_command, "http-timeout", type=positive, default=30)
     add(forward_command, "event-chunk-size", type=positive, default=16000)
-    add(common, "event-file artifacts-dir", type=Path, required=True)
-    add(common, "event-name repository request-id run-url run-id", required=True)
+    add(common, "event-file", type=Path, required=True)
+    add(common, "event-name request-id run-url run-id", required=True)
+    add(common, "repository", default=REPOSITORY)
+    add(common, "artifacts-dir", type=Path, default=Path("review-artifacts"))
     add(common, "github-token-file temp-dir", type=Path)
     add(common, "skip-policy", type=Path, default=ROOT / "skip-policy.json")
     add(common, "api-timeout", type=positive, default=60)
     add(common, "sync-timeout", type=positive, default=1200)
     commands.add_parser("sync", parents=[common], help="Validate local/skip events and aggregate status")
     review = commands.add_parser("review", parents=[common], help="Run review or runtime canary")
-    add(review, "repository-url oss-endpoint auth-prefix codex-package codex-checksum codex-version", required=True)
     add(review, "oss-access-key-file oss-secret-key-file", type=Path, required=True)
     add(review, "telemetry-public-key-file telemetry-secret-key-file", type=Path)
     add(review, "command-timeout oss-timeout", type=positive)
-    add(review, "trusted-revision review-author memories-object sessions-prefix telemetry-url canary-auth-object",
-        default="")
-    for name, default in {
-        "model": "gpt-6.1-sol", "fallback-model": "gpt-6-sol", "effort": "xhigh", "ossutil": "ossutil",
-        "codex-binary-checksum": "a0d5ec053074d66570aa967129d350541f344f76671a199b5a7bc0d45366cdf7",
-        "trace-name": "doris-ai-review", "subagent-trace-name": "doris-ai-review-subagent",
-        "environment": "teamcity", "workflow-name": "Code Review Runner",
-    }.items():
+    for name, default in REVIEW_DEFAULTS.items():
         add(review, name, default=default)
     add(review, "templates", type=Path, default=ROOT / "prompts")
     limits = {"review-timeout": 7200, "cleanup-reserve": 120, "usage-limit-backoff": 1800,
               "context-threads": 30, "context-body-chars": 1200, "telemetry-max-bytes": 4000000,
               "canary-timeout": 180, "canary-step-timeout": 1080, "canary-job-timeout": 1500}
-    # Step budgets in seconds; settings.kts sizes the TeamCity execution timeout from their sum.
+    # Step budgets in seconds; settings.kts must give the review build more than their sum.
     limits.update({name + "-timeout": seconds for name, seconds in {
         "resolve": 120, "status": 300, "checkout": 600, "install": 600, "verify": 120, "auth": 300,
         "memories": 300, "threads": 300, "context": 600, "diagnostics": 120, "record": 300,
@@ -307,8 +322,8 @@ def validate(options, event):
         raise ValueError("Review timeout must exceed the cleanup reserve")
     if event.canary and not options.canary_auth_object:
         raise ValueError("Canary requires --canary-auth-object")
-    if not event.canary and not (options.review_author and options.trusted_revision):
-        raise ValueError("Review requires --review-author and --trusted-revision")
+    if not event.canary and not options.trusted_revision:
+        raise ValueError("Review requires --trusted-revision")
 
 
 def run_worker(options):
@@ -331,6 +346,9 @@ def run_worker(options):
         with step("Synchronize review status", options.sync_timeout):
             statuses.synchronize(event)
         return 0
+    if not options.review_author:
+        options.review_author = request_json("user", env=env, timeout=options.api_timeout)["login"]
+        logging.info("Reviewing as %s, the owner of the GitHub token", options.review_author)
     with object_store(options) as store, Workspace(options.temp_dir) as workspace:
         runtime = Runtime(options, store, AuthPool(store, options.auth_prefix), env)
         return ReviewWorkflow(options, github, statuses, runtime).run(event, workspace)
