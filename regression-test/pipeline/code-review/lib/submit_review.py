@@ -22,30 +22,31 @@ import argparse
 import hashlib
 import json
 import re
-import time
+import subprocess
 from collections import Counter
 from pathlib import Path
 
 from process import require, write_json
-from review_github_api import request_json
+from review_github_api import GitHub, ReviewSuperseded
 
 SUBMISSION_FILE = "review-submission.json"
 REJECTION_FILE = "review-submission-rejected.json"
 RUN_FILE = "review-run.json"
 RESULT_FILE = "review-result.json"
 PRIORITY = re.compile(r"^\[P([0-3])\]\s+\S")
+FIELDS = {"body", "comments", "existing_blocking_comment_ids", "converged", "rounds", "incomplete_reason"}
+COMMENT_FIELDS = {"path", "line", "side", "body"}
+API_TIMEOUT = 30
 
 
 def priority(body):
     match = PRIORITY.match(body)
-    if match is None:
-        raise ValueError("Every finding must start with [P0], [P1], [P2] or [P3]")
+    require(match is not None, "Every finding must start with [P0], [P1], [P2] or [P3]")
     return int(match.group(1))
 
 
 def validate_submission(value):
-    fields = {"body", "comments", "existing_blocking_comment_ids", "converged", "rounds", "incomplete_reason"}
-    require(isinstance(value, dict) and set(value) == fields, f"Final review requires {sorted(fields)}")
+    require(isinstance(value, dict) and set(value) == FIELDS, f"Final review requires {sorted(FIELDS)}")
     require(type(value["converged"]) is bool, "converged must be a boolean")
     require(type(value["rounds"]) is int and 1 <= value["rounds"] <= 3, "rounds must be an integer from 1 to 3")
     reason = value["incomplete_reason"]
@@ -55,10 +56,11 @@ def validate_submission(value):
     require(isinstance(value["body"], str) and value["body"].strip(), "Final review summary is empty")
     require(isinstance(value["comments"], list), "comments must be an array")
     for comment in value["comments"]:
-        require(isinstance(comment, dict) and set(comment) == {"path", "position", "body"},
-                "Each finding requires path, position and body")
+        require(isinstance(comment, dict) and set(comment) == COMMENT_FIELDS,
+                "Each finding requires exactly path, line, side and body")
         require(isinstance(comment["path"], str) and comment["path"], "Finding path is empty")
-        require(type(comment["position"]) is int and comment["position"] > 0, "Finding position must be positive")
+        require(type(comment["line"]) is int and comment["line"] > 0, "Finding line must be a positive integer")
+        require(comment["side"] in {"LEFT", "RIGHT"}, "Finding side must be LEFT or RIGHT")
         require(isinstance(comment["body"], str), "Finding body must be text")
         priority(comment["body"])
     ids = value["existing_blocking_comment_ids"]
@@ -68,134 +70,130 @@ def validate_submission(value):
     return value
 
 
-def api(path, remaining, *, payload=None, paginated=False):
-    return request_json(path, payload=payload, pages=paginated, timeout=min(30, remaining()))
+def anchor(comment):
+    return comment["path"], comment.get("line"), comment.get("side"), comment["body"]
 
 
-def check_target(run, remaining):
-    root = f"repos/{run['repository']}/pulls/{run['pr_number']}"
-    pr = api(root, remaining)
-    if (pr["state"] != "open" or pr["head"]["sha"] != run["head_sha"]
-            or pr["base"]["sha"] != run["base_sha"]):
-        raise ValueError("PR base/head or open state changed; final review is stale")
-    return root
+class Delivery:
+    """The final review declared by one runner invocation, verified by exact GitHub readback."""
 
+    def __init__(self, context, run, github=None):
+        self.context, self.run = context, run
+        # run["deadline"] is CLOCK_MONOTONIC, which Linux shares across processes.
+        self.github = github or GitHub(run["repository"], timeout=API_TIMEOUT, deadline=run["deadline"])
+        self.pulls = f"pulls/{run['pr_number']}"
 
-def review_payload(submission, run, root, remaining):
-    counts = [0, 0, 0, 0]
-    for comment in submission["comments"]:
-        counts[priority(comment["body"])] += 1
-    # Previously reported findings are not posted again. The reviewer must
-    # explicitly reconfirm which existing P0/P1 findings still apply to this head.
-    ids = submission["existing_blocking_comment_ids"]
-    if ids:
-        comments = {c["id"]: c for c in api(f"{root}/comments", remaining, paginated=True)}
-        for comment_id in ids:
-            comment = comments.get(comment_id)
-            if comment is None or comment.get("in_reply_to_id") is not None:
-                raise ValueError(f"Existing blocking finding {comment_id} is missing or a reply")
-            # Older reviews may bold the whole heading or only the priority.
-            # Normalize existing comments only; new findings keep their strict format.
-            body = re.sub(r"^\*\*(\[P[0-3]\])(?:\*\*)?", r"\1", comment["body"], count=1)
-            level = priority(body)
-            if level > 1:
-                raise ValueError(f"Existing finding {comment_id} is not P0/P1")
-            counts[level] += 1
-    # The marker binds the entire declared final submission to this invocation,
-    # including the deduplicated findings. A parallel run cannot satisfy it.
-    digest = hashlib.sha256(json.dumps(submission, sort_keys=True).encode()).hexdigest()
-    marker = f"<!-- code-review-completion:{run['token']}:{digest} -->"
-    body = submission["body"]
-    # Render the declared convergence state ourselves and bind it to the same
-    # digest/readback as the findings. A delivered review can still be incomplete.
-    if submission["converged"]:
-        body += f"\n\nReview converged after {submission['rounds']} round(s)."
-    else:
-        body += (
-            "\n\n**Review did not converge after 3 rounds. This automated review cannot pass the review check.**"
-            f"\n\n{submission['incomplete_reason']}"
-        )
-    if ids:
-        body += "\n\nExisting P0/P1 findings confirmed for this head: " + ", ".join(
-            f"https://github.com/{run['repository']}/pull/{run['pr_number']}#discussion_r{i}"
-            for i in ids
-        )
-    body += f"\n\n{marker}"
-    return {
-        "commit_id": run["head_sha"],
-        "event": "REQUEST_CHANGES" if counts[0] + counts[1] else "COMMENT",
-        "body": body,
-        "comments": submission["comments"],
-    }, counts, marker
+    def require_target(self):
+        self.github.require_target(self.run["pr_number"], self.run["head_sha"], self.run["base_sha"])
 
+    def reviews(self):
+        return self.github.api(f"{self.pulls}/reviews", pages=True)
 
-def verify_completion(context, run, remaining, *, submit=False, submission=None):
-    """Never infer completion from an unowned review or a local result file."""
-    path = context / SUBMISSION_FILE
-    if submission is None:
-        if not path.exists():
-            rejection = context / REJECTION_FILE
-            if rejection.exists():
-                raise ValueError(json.loads(rejection.read_text())["reason"])
-            raise ValueError("No final review submission was declared")
-        submission = json.loads(path.read_text())
-    submission = validate_submission(submission)
-    if path.exists() and json.loads(path.read_text()) != submission:
-        raise ValueError("Final submission already declared; refusing a different review")
-    root = check_target(run, remaining)
-    payload, counts, marker = review_payload(submission, run, root, remaining)
-    reviews = api(f"{root}/reviews", remaining, paginated=True)
-    matching = [r for r in reviews if marker in (r.get("body") or "")]
-    if not matching and submit:
-        if any(r.get("user", {}).get("login") == run["review_author"]
-               and r.get("commit_id") == run["head_sha"]
-               and (r.get("submitted_at") or "") >= run["started_at"] for r in reviews):
-            reason = "Another bot review was submitted during this run; refusing duplicate submission"
-            # This is a rejected candidate, not a POST intent or proof of delivery.
-            # Keep it separate so completion still requires exact GitHub readback.
-            write_json(context / REJECTION_FILE, {"reason": reason, "submission": submission})
-            raise ValueError(reason)
-        if path.exists():
-            raise ValueError("Final submission was attempted but cannot be verified; refusing to repost")
-        # Persist the complete intent before POST: if the response is lost, the
-        # runner can read back this exact review without repeating the write.
-        # Exclusive creation also prevents two accidental simultaneous helper
-        # invocations from both posting after their initial read found no review.
+    def comments(self):
+        return self.github.api(f"{self.pulls}/comments", pages=True)
+
+    def owned(self, item):
+        """Whether the review bot wrote this review/comment on this head after the invocation started."""
+        run = self.run
+        return ((item.get("user") or {}).get("login") == run["review_author"]
+                and item.get("commit_id") == run["head_sha"]
+                and (item.get("submitted_at") or item.get("created_at") or "") >= run["started_at"])
+
+    def payload(self, submission):
+        counts = [0, 0, 0, 0]
+        for comment in submission["comments"]:
+            counts[priority(comment["body"])] += 1
+        # Previously reported findings are not posted again. The reviewer must
+        # explicitly reconfirm which existing P0/P1 findings still apply to this head.
+        ids = submission["existing_blocking_comment_ids"]
+        if ids:
+            existing = {comment["id"]: comment for comment in self.comments()}
+            for comment_id in ids:
+                comment = existing.get(comment_id)
+                require(comment is not None and comment.get("in_reply_to_id") is None,
+                        f"Existing blocking finding {comment_id} is missing or a reply")
+                # Older reviews may bold the whole heading or only the priority.
+                level = priority(re.sub(r"^\*\*(\[P[0-3]\])(?:\*\*)?", r"\1", comment["body"], count=1))
+                require(level <= 1, f"Existing finding {comment_id} is not P0/P1")
+                counts[level] += 1
+        # The marker binds the entire declared submission to this invocation;
+        # a parallel run cannot satisfy it.
+        digest = hashlib.sha256(json.dumps(submission, sort_keys=True).encode()).hexdigest()
+        marker = f"<!-- code-review-completion:{self.run['token']}:{digest} -->"
+        body = submission["body"]
+        if submission["converged"]:
+            body += f"\n\nReview converged after {submission['rounds']} round(s)."
+        else:
+            body += ("\n\n**Review did not converge after 3 rounds. This automated review cannot pass the review "
+                     f"check.**\n\n{submission['incomplete_reason']}")
+        if ids:
+            body += "\n\nExisting P0/P1 findings confirmed for this head: " + ", ".join(
+                f"https://github.com/{self.run['repository']}/pull/{self.run['pr_number']}#discussion_r{i}"
+                for i in ids)
+        body += f"\n\n{marker}"
+        event = "REQUEST_CHANGES" if counts[0] + counts[1] else "COMMENT"
+        return {"commit_id": self.run["head_sha"], "event": event, "body": body,
+                "comments": submission["comments"]}, counts, marker
+
+    def post(self, path, submission, payload):
+        # Persist the intent before POST: if the response is lost, the review is read
+        # back instead of posted twice. Exclusive creation also stops two simultaneous
+        # helper calls from both posting after their initial read found no review.
         with path.open("x") as handle:
             json.dump(submission, handle)
-        api(f"{root}/reviews", remaining, payload=payload)
-        matching = [r for r in api(f"{root}/reviews", remaining, paginated=True)
-                    if marker in (r.get("body") or "")]
-    if len(matching) != 1:
-        raise ValueError("Could not verify exactly one final review from this invocation")
-    review = matching[0]
-    expected_state = "CHANGES_REQUESTED" if payload["event"] == "REQUEST_CHANGES" else "COMMENTED"
-    if (review.get("user", {}).get("login") != run["review_author"]
-            or review.get("commit_id") != run["head_sha"]
-            or (review.get("submitted_at") or "") < run["started_at"]
-            or review.get("state") != expected_state
-            or review.get("body") != payload["body"]):
-        raise ValueError("Final review author, head, timestamp, state or summary did not match")
-    # Replies may arrive while the model wraps up. They are not part of the
-    # declared inline set and must not invalidate an otherwise complete review.
-    comments = [c for c in api(f"{root}/reviews/{review['id']}/comments", remaining, paginated=True)
-                if c.get("in_reply_to_id") is None]
-    expected = Counter((c["path"], c["position"], c["body"]) for c in payload["comments"])
-    actual = Counter((c["path"], c.get("position"), c["body"]) for c in comments)
-    if actual != expected or any(
-        c.get("user", {}).get("login") != run["review_author"]
-        or c.get("commit_id") != run["head_sha"] for c in comments
-    ):
-        raise ValueError("Final review inline comments were not completely verified")
-    # Recheck after the API reads so a moving PR cannot pass an obsolete review.
-    check_target(run, remaining)
-    return {
-        "state": "failure" if counts[0] + counts[1] or not submission["converged"] else "success",
-        "converged": submission["converged"], "rounds": submission["rounds"],
-        "incomplete_reason": submission["incomplete_reason"],
-        "p0": counts[0], "p1": counts[1], "review_id": review["id"],
-        "review_url": review["html_url"],
-    }
+        try:
+            self.github.api(f"{self.pulls}/reviews", payload=payload)
+        except subprocess.CalledProcessError as error:
+            if 400 <= (getattr(error, "http_status", None) or 0) < 500:
+                path.unlink()  # GitHub rejected it, so nothing was posted; allow a corrected submission.
+            raise
+
+    def verify(self, submission=None, *, submit=False):
+        """Return the verified verdict; never infer completion from an unowned review or a local file."""
+        path = self.context / SUBMISSION_FILE
+        if submission is None:
+            if not path.exists():
+                rejection = self.context / REJECTION_FILE
+                if rejection.exists():
+                    raise ReviewSuperseded(json.loads(rejection.read_text())["reason"])
+                raise ValueError("No final review submission was declared")
+            submission = json.loads(path.read_text())
+        submission = validate_submission(submission)
+        require(not path.exists() or json.loads(path.read_text()) == submission,
+                "Final submission already declared; refusing a different review")
+        self.require_target()
+        payload, counts, marker = self.payload(submission)
+        reviews = self.reviews()
+        matching = [review for review in reviews if marker in (review.get("body") or "")]
+        if not matching and submit:
+            if any(self.owned(review) for review in reviews):
+                reason = "Another review run submitted a review for this head; refusing a duplicate"
+                # A rejected candidate, not a POST intent: completion still requires readback.
+                write_json(self.context / REJECTION_FILE, {"reason": reason, "submission": submission})
+                raise ReviewSuperseded(reason)
+            require(not path.exists(), "Final submission was attempted but cannot be verified; refusing to repost")
+            self.post(path, submission, payload)
+            matching = [review for review in self.reviews() if marker in (review.get("body") or "")]
+        require(len(matching) == 1, "Could not verify exactly one final review from this invocation")
+        review = matching[0]
+        expected_state = "CHANGES_REQUESTED" if payload["event"] == "REQUEST_CHANGES" else "COMMENTED"
+        require(self.owned(review) and review.get("state") == expected_state and review.get("body") == payload["body"],
+                "Final review author, head, timestamp, state or summary did not match")
+        # Replies may arrive while the model wraps up. They are not part of the
+        # declared inline set and must not invalidate an otherwise complete review.
+        comments = [comment for comment in self.comments()
+                    if comment.get("pull_request_review_id") == review["id"] and comment.get("in_reply_to_id") is None]
+        require(Counter(map(anchor, comments)) == Counter(map(anchor, payload["comments"]))
+                and all(self.owned(comment) for comment in comments),
+                "Final review inline comments were not completely verified")
+        # Recheck after the API reads so a moving PR cannot pass an obsolete review.
+        self.require_target()
+        return {
+            "state": "failure" if counts[0] + counts[1] or not submission["converged"] else "success",
+            "converged": submission["converged"], "rounds": submission["rounds"],
+            "incomplete_reason": submission["incomplete_reason"],
+            "p0": counts[0], "p1": counts[1], "review_id": review["id"], "review_url": review["html_url"],
+        }
 
 
 def main():
@@ -204,17 +202,7 @@ def main():
     parser.add_argument("--input-file", type=Path, required=True)
     args = parser.parse_args()
     run = json.loads((args.context_dir / RUN_FILE).read_text())
-
-    def remaining():
-        seconds = run["deadline"] - time.monotonic()
-        if seconds <= 0:
-            raise TimeoutError("Review's shared time budget was exhausted")
-        return seconds
-
-    result = verify_completion(
-        args.context_dir, run, remaining, submit=True,
-        submission=json.loads(args.input_file.read_text()),
-    )
+    result = Delivery(args.context_dir, run).verify(json.loads(args.input_file.read_text()), submit=True)
     print(json.dumps(result))
 
 

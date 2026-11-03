@@ -38,33 +38,29 @@ def main():
     # FIXME: Set REVIEW_CONTROLLER_DIR to the independently checked-out master
     # directory (regression-test/pipeline/code-review); never the PR checkout.
     controller = Path(os.environ["REVIEW_CONTROLLER_DIR"]).resolve()
+    sys.path.insert(0, str(controller))
+    # Import from the trusted checkout so cancellation always unwinds the
+    # worker's finalizers before this adapter deletes its secret files.
+    from main import MAX_EVENT_PARTS, Event, cancel
+    from main import main as worker
     mode, *arguments = sys.argv[1:]
     if mode not in {"review", "sync"}:
         raise ValueError("Expected review or sync")
     os.umask(0o077)
-
-    def cancelled(_signum, _frame):
-        raise KeyboardInterrupt
-
-    signal.signal(signal.SIGTERM, cancelled)
+    signal.signal(signal.SIGTERM, cancel)
+    count = int(os.environ["REVIEW_EVENT_PARTS"])
+    if not 0 < count <= MAX_EVENT_PARTS:
+        raise ValueError("Invalid number of event chunks")
+    encoded = "".join(os.environ[f"REVIEW_EVENT_{index:04d}"] for index in range(count))
+    event = json.loads(base64.b64decode(encoded, validate=True))
+    parsed = Event(os.environ["REVIEW_EVENT_NAME"], event)
+    # A filtered event needs no service credentials. Canary uses OSS only.
+    if not parsed.wanted(mode):
+        return 0
     with tempfile.TemporaryDirectory(prefix="review-input-", dir=os.environ.get("REVIEW_TEMP_DIR")) as temporary:
         directory = Path(temporary)
-        count = int(os.environ["REVIEW_EVENT_PARTS"])
-        if not 0 < count <= 128:
-            raise ValueError("Invalid number of event chunks")
-        encoded = "".join(os.environ[f"REVIEW_EVENT_{index:04d}"] for index in range(count))
-        event = json.loads(base64.b64decode(encoded, validate=True))
         event_path = directory / "event.json"
         event_path.write_text(json.dumps(event))
-        sys.path.insert(0, str(controller))
-        from main import Event
-        from main import main as worker
-        parsed = Event(os.environ["REVIEW_EVENT_NAME"], event)
-        # A filtered event needs no service credentials. Canary uses OSS only.
-        if mode == "review" and not (parsed.review or parsed.canary):
-            return 0
-        if mode == "sync" and not (parsed.local_pass or parsed.skip or parsed.status_heads):
-            return 0
         arguments.extend(["--temp-dir", str(directory)])
         secrets = [] if parsed.canary else [("REVIEW_GITHUB_TOKEN", "--github-token-file")]
         if mode == "review":
@@ -88,10 +84,7 @@ def main():
         if mode == "review" and not parsed.canary:
             revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=controller, text=True).strip()
             arguments.extend(["--trusted-revision", revision])
-        # Import from the trusted checkout so cancellation always unwinds the
-        # worker's finalizers before this adapter deletes its secret files.
         return worker([mode, *arguments])
-
 
 if __name__ == "__main__":
     sys.exit(main())

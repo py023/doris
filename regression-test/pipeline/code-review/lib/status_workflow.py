@@ -20,11 +20,9 @@
 import fnmatch
 import logging
 import re
-import subprocess
 from datetime import datetime, timedelta
 
-from process import require, require_full_sha
-from review_github_api import redact
+from process import RECOVERABLE, log_failure, require, require_full_sha
 
 FIELDS = 'schema status pr commit base reviewed_at reviewer model effort findings rounds converged'.split()
 BEGIN, END = '<!-- doris-repo-review:v1:begin -->', '<!-- doris-repo-review:v1:end -->'
@@ -34,6 +32,9 @@ EFFORTS = {
     **{model: {'xhigh', 'max', 'ultra'} for model in ('gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-astra')},
 }
 SOURCE = re.compile(r'code-review/source/(automated|local|skip)/pr-(\d+)/base-([0-9a-fA-F]{40})')
+MAX_BASE_LAG = timedelta(hours=48)
+# Concurrent workers may interleave their aggregate writes; see StatusWorkflow.aggregate.
+AGGREGATE_ROUNDS = 3
 
 
 def parse_comment(comment):
@@ -41,11 +42,13 @@ def parse_comment(comment):
     require(comment.index(BEGIN) < comment.index(END), 'Review markers are out of order')
     blocks = re.findall(r'```yaml\n(.*?)\n```', comment.split(BEGIN)[1].split(END)[0], flags=re.DOTALL)
     require(len(blocks) == 1, 'Expected one fenced yaml block')
-    rows = [(key.strip(), value.strip()) for key, value in (line.split(':', 1) for line in blocks[0].splitlines())]
-    require([key for key, _ in rows] == FIELDS, 'Comment fields do not match the v1 schema')
-    fields = dict(rows)
+    rows = [line.partition(':') for line in blocks[0].splitlines()]
+    require(all(separator for _, separator, _ in rows), 'Every yaml line must be "key: value"')
+    require([key.strip() for key, _, _ in rows] == FIELDS, 'Comment fields do not match the v1 schema')
+    fields = {key.strip(): value.strip() for key, _, value in rows}
     findings = re.fullmatch(r'\{blocker: (\d+), major: (\d+), minor: (\d+), nit: (\d+)\}', fields['findings'])
     require(findings is not None, 'Findings must use the v1 inline-map format')
+    require(fields['rounds'].isdigit(), 'Rounds must be an integer')
     fields['findings'] = tuple(map(int, findings.groups()))
     fields['rounds'] = int(fields['rounds'])
     return fields
@@ -86,13 +89,15 @@ def resolve_status(pulls, statuses, head):
     if not contexts:
         return 'pending', f'No open pull request currently uses {head[:12]}.'
     latest = {item['context']: item for item in sorted(statuses, key=lambda item: item['id'])}
-    approved, blocked, incomplete = set(), set(), set()
+    approved, blocked, incomplete, automated = set(), set(), set(), {}
     for context, item in latest.items():
         match = SOURCE.fullmatch(context)
         if match is None:
             continue
         kind, number, base = match.groups()
         key = (int(number), base.casefold())
+        if kind == 'automated':
+            automated[key] = item
         if item['state'] == 'success':
             approved.add(key)
         elif kind == 'automated' and item['state'] == 'failure':
@@ -108,7 +113,9 @@ def resolve_status(pulls, statuses, head):
     if missing:
         number, base = min(missing)
         suffix = f' (+{len(missing) - 1} more)' if len(missing) > 1 else ''
-        return 'pending', f'Awaiting code review for PR #{number} at {base[:12]}{suffix}.'
+        source = automated.get((number, base), {})
+        description = source.get('description') or f'Awaiting code review for PR #{number} at {base[:12]}'
+        return 'pending', description.rstrip('.') + suffix + '.'
     noun = 'context' if len(contexts) == 1 else 'contexts'
     return 'success', f'Code review passed for {len(contexts)} open PR {noun} on {head[:12]}.'
 
@@ -125,16 +132,25 @@ class StatusWorkflow:
         return self.github.status(head, context, state, description, url or self.run_url)
 
     def aggregate(self, head):
-        self.publish(head, 'pending', f'Recalculating code review for {head[:12]}.')
-        pulls = self.github.api('pulls?state=open&per_page=100', pages=True)
-        statuses = self.github.api(f'commits/{head}/statuses?per_page=100', pages=True)
-        state, description = resolve_status(pulls, statuses, head)
-        self.publish(head, state, description)
+        """Publish the combined status of head, then re-read the sources until they agree with it.
+
+        Every source write is followed by an aggregate from the same worker. Because each
+        aggregate re-verifies after its own write, the last write reflects every source
+        status written before it, however concurrent workers interleave.
+        """
+        published = None
+        for _ in range(AGGREGATE_ROUNDS):
+            current = resolve_status(self.github.api('pulls?state=open&per_page=100', pages=True),
+                                     self.github.api(f'commits/{head}/statuses?per_page=100', pages=True), head)
+            if current == published:
+                return
+            self.publish(head, *current)
+            published = current
 
     def begin_review(self, number, head, base):
-        self.publish(head, 'pending', f'Automated review is running for PR #{number}.')
         self.publish(head, 'pending', f'Automated review is running for PR #{number} at {base[:12]}.',
                      context=self.source('automated', number, base))
+        self.aggregate(head)
 
     def finish_review(self, number, head, base, *, result, execution_succeeded):
         state = 'pending'
@@ -149,44 +165,44 @@ class StatusWorkflow:
         self.publish(head, state, description, context=self.source('automated', number, base))
 
     def approve(self, kind, number, head, base, description, url):
-        self.publish(head, 'pending', f'Recalculating code review for PR #{number}.', url=url)
         self.publish(head, 'success', description, context=self.source(kind, number, base), url=url)
         self.aggregate(head)
 
     def accept_local(self, event):
-        comment = event.comment
+        comment, number = event.comment, event.pr_number
         author = comment['user']['login']
         if author != event.data['sender']['login']:
             logging.info('Ignoring local PASS: comment creator and sender differ')
             return
-        try:
-            permission = self.github.api(f'collaborators/{author}/permission')['permission']
-            require(permission in {'write', 'admin'}, 'Comment creator needs write permission')
-        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
-            logging.info('Ignoring local PASS: %s', redact(str(error)))
+        if self.github.api(f'collaborators/{author}/permission')['permission'] not in {'write', 'admin'}:
+            logging.info('Ignoring local PASS: comment creator needs write permission')
             return
-        number = event.pr_number
         pr = self.github.pull(number)
+        head, base = pr['head']['sha'], pr['base']['sha']
         try:
             require(pr['state'] == 'open', 'PR is not open')
-            head, base = pr['head']['sha'], pr['base']['sha']
             fields = parse_comment(comment['body'])
             validate_comment(fields, self.github.repository, number, head, base, author)
-            reviewed = fields['base']
-            comparison = self.github.api(f'compare/{reviewed}...{base}')['status']
-            if reviewed.casefold() == base.casefold():
-                require(comparison == 'identical', 'Equal bases must have compare status identical')
-            else:
-                require(comparison == 'ahead', 'Reviewed base is not an ancestor of the current base')
-                times = [timestamp(self.github.api(f'commits/{sha}')['commit']['committer']['date'])
-                         for sha in (reviewed, base)]
-                require(timedelta(0) <= times[1] - times[0] <= timedelta(hours=48),
-                        'Reviewed base must be within 48 hours of the current base')
-        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
-            logging.info('Ignoring local PASS: %s', redact(str(error)))
+            self.require_recent_base(fields['base'], base)
+        except ValueError as error:
+            # The author has write permission, so tell them why their PASS did not count.
+            logging.info('Rejecting local PASS: %s', error)
+            self.github.comment(number, f"Local review PASS was not accepted for {head[:12]}: {error}.\n\n"
+                                        f"Comment: {comment['html_url']}")
             return
         self.approve('local', number, head, base, f'Local review passed for PR #{number} at {base[:12]}.',
                      comment['html_url'])
+
+    def require_recent_base(self, reviewed, base):
+        """The reviewed base must be the current base, or an ancestor at most MAX_BASE_LAG older."""
+        comparison = self.github.api(f'compare/{reviewed}...{base}')['status']
+        if reviewed.casefold() == base.casefold():
+            require(comparison == 'identical', 'Equal bases must have compare status identical')
+            return
+        require(comparison == 'ahead', 'Reviewed base is not an ancestor of the current base')
+        old, new = (timestamp(self.github.api(f'commits/{sha}')['commit']['committer']['date'])
+                    for sha in (reviewed, base))
+        require(timedelta(0) <= new - old <= MAX_BASE_LAG, 'Reviewed base must be within 48 hours of the current base')
 
     def skip_review(self, event):
         number = event.pr_number
@@ -213,8 +229,8 @@ class StatusWorkflow:
         for operation, argument in actions:
             try:
                 operation(argument)
-            except (OSError, ValueError, subprocess.SubprocessError) as error:
-                logging.error("Status synchronization failed: %s", redact(str(error)))
+            except RECOVERABLE as error:
+                log_failure('Status synchronization', error)
                 failures.append(error)
         if failures:
             raise RuntimeError(f"{len(failures)} status synchronization operation(s) failed") from failures[0]

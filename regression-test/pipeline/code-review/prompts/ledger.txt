@@ -1,32 +1,21 @@
 # Shared Subagent Review Ledger
 
-This is the shared source of truth for subagent-assisted review.
+This is the shared source of truth for subagent-assisted review. The main agent owns every `## Main ...`
+section, the final statuses and deduplication, the GitHub review submission and its verification.
 
-Rules:
-- Subagents must read this whole file before reviewing.
-- Each subagent may append only to its assigned section under `Subagent Candidate Sections`.
-- Subagents must not rewrite this file, edit another subagent section, edit main-owned sections, edit repository source files, or submit GitHub comments.
-- Avoid duplicates. If a candidate overlaps an existing candidate, add a duplicate note in your own section that references the existing candidate ID.
-- The main agent owns final status, final deduplication, GitHub review submission, and GitHub API verification.
-
-## Main Initial Risk Scan
-
-Main-owned format:
-
-- ID:
-  Status:
-  Changed files/lines:
-  Related mechanisms to inspect:
-  Why suspicious:
-  Required upstream/downstream files or paths:
-  Question for risk-focused subagent:
-  Final conclusion:
+Rules for subagents:
+- Read this whole file before reviewing.
+- Append only to your own section under `## Subagent Candidate Sections`.
+- Never rewrite this file, edit another section, edit repository source files, or submit GitHub comments.
+- If a candidate overlaps an existing one, record it with status `duplicate` and reference the existing candidate ID.
 
 Candidate statuses:
-- proposed_by_subagent
-- accepted_for_inline_comment
-- dismissed_with_evidence
-- duplicated
+- proposed: recorded by a subagent and not yet verified by the main agent
+- accepted: verified; belongs to the proposed final comment set
+- already_reported: covered by an existing review thread
+- duplicate: covered by another candidate ID
+- dismissed: disproved, with concrete evidence
+- unresolved: still open, with the concrete remaining question
 
 Candidate format:
 
@@ -40,9 +29,26 @@ Candidate format:
   Duplicate relationship:
   Recommendation:
 
+## Main Initial Risk Scan
+
+Risk focus item format (Status: open, concluded or unresolved):
+
+- ID:
+  Status:
+  Changed files/lines:
+  Related mechanisms to inspect:
+  Why suspicious:
+  Required upstream/downstream files or paths:
+  Question for risk-focused subagent:
+  Final conclusion:
+
+## Subagent Candidate Sections
+
+The main agent adds one `### <subagent ID>: <assigned scope>` section here for each subagent it spawns.
+
 ## Main Merged Findings
 
-Main-owned format:
+Format:
 
 - ID:
   Source IDs:

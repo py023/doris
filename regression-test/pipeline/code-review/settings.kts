@@ -56,8 +56,9 @@ val reviewArguments = """
 fun reviewBuild(identifier: String, title: String, mode: String) = BuildType {
     id(identifier)
     name = title
-    // Configure per-PR review and per-SHA status serialization in TeamCity.
-    // Workers do not lock; capacity comes from the agent pool.
+    // No TeamCity lock is needed: aggregation re-verifies the status after every
+    // write, and a review that loses a race to another run for the same head
+    // stops as superseded. Capacity comes from the agent pool.
     maxRunningBuilds = 0
     // FIXME: configure TeamCity artifact cleanup to retain failed-review
     // diagnostics for 14 days, matching the former upload-artifact retention.
@@ -103,7 +104,9 @@ fun reviewBuild(identifier: String, title: String, mode: String) = BuildType {
         // CODEX_HOME, PR checkouts and packages are private to each build.
         equals("review.worker", "true")
     }
-    failureConditions { executionTimeoutMin = if (mode == "review") 238 else 360 }
+    // Review: the sum of main.py's step budgets (about 224 minutes) plus slack.
+    // Sync: --sync-timeout (20 minutes) plus slack.
+    failureConditions { executionTimeoutMin = if (mode == "review") 238 else 30 }
     // No Commit Status Publisher: the Python workflow owns code-review status.
 }
 
