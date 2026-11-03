@@ -1,0 +1,63 @@
+# Shared Subagent Review Ledger
+
+This is the shared source of truth for subagent-assisted review.
+
+Rules:
+- Subagents must read this whole file before reviewing.
+- Each subagent may append only to its assigned section under `Subagent Candidate Sections`.
+- Subagents must not rewrite this file, edit another subagent section, edit main-owned sections, edit repository source files, or submit GitHub comments.
+- Avoid duplicates. If a candidate overlaps an existing candidate, add a duplicate note in your own section that references the existing candidate ID.
+- The main agent owns final status, final deduplication, GitHub review submission, and GitHub API verification.
+
+## Main Initial Risk Scan
+
+Main-owned format:
+
+- ID:
+  Status:
+  Changed files/lines:
+  Related mechanisms to inspect:
+  Why suspicious:
+  Required upstream/downstream files or paths:
+  Question for risk-focused subagent:
+  Final conclusion:
+
+Candidate statuses:
+- proposed_by_subagent
+- accepted_for_inline_comment
+- dismissed_with_evidence
+- duplicated
+
+Candidate format:
+
+- ID:
+  Owner:
+  Status:
+  Path:
+  Line:
+  Claim:
+  Evidence:
+  Duplicate relationship:
+  Recommendation:
+
+## Main Merged Findings
+
+Main-owned format:
+
+- ID:
+  Source IDs:
+  Owner: main
+  Status:
+  Path:
+  Line:
+  Claim:
+  Evidence:
+  Duplicate relationship:
+  Main verification:
+  Proposed inline body:
+
+## Dismissed Or Duplicate Points
+
+## Proposed Final Comment Set
+
+## Convergence Rounds
