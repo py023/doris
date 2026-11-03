@@ -189,7 +189,9 @@ def forward(options):
     payload = build_request(event, event_name=options.event_name, build_type=options.teamcity_build_type,
                             request_id=options.request_id, origin_url=options.origin_url,
                             chunk_size=options.event_chunk_size)
-    enqueue(options.teamcity_url, read_secret(options.teamcity_token_file), payload, timeout=options.http_timeout)
+    # The token comes from the environment so that it never appears in argv.
+    token = secret_text(os.environ.pop("TEAMCITY_TOKEN", ""))
+    enqueue(options.teamcity_url, token, payload, timeout=options.http_timeout)
     return 0
 
 
@@ -200,17 +202,21 @@ def positive(value):
     return result
 
 
-def read_secret(path):
-    value = Path(path).read_text().rstrip("\r\n")
+def secret_text(value):
+    value = value.rstrip("\r\n")
     if not value or "\n" in value or "\r" in value:
-        raise ValueError("Credential file must contain one nonempty line of text")
+        raise ValueError("A credential must be one nonempty line of text")
     return value
+
+
+def read_secret(path):
+    return secret_text(Path(path).read_text())
 
 
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
     commands = result.add_subparsers(dest="command", required=True)
-    forward_command = commands.add_parser("forward", help="Enqueue an event in TeamCity")
+    forward_command = commands.add_parser("forward", help="Enqueue an event in TeamCity (token: $TEAMCITY_TOKEN)")
     common = argparse.ArgumentParser(add_help=False)
 
     def add(target, names, **config):
@@ -218,7 +224,7 @@ def parser():
         for name in names.split():
             target.add_argument("--" + name, **config)
 
-    add(forward_command, "event-file teamcity-token-file", type=Path, required=True)
+    add(forward_command, "event-file", type=Path, required=True)
     add(forward_command, "event-name request-id origin-url teamcity-url teamcity-build-type", required=True)
     add(forward_command, "http-timeout", type=positive, default=30)
     add(forward_command, "event-chunk-size", type=positive, default=16000)
