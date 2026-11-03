@@ -54,8 +54,7 @@ jobs:
           TEAMCITY_BUILD_TYPE: ${{ vars.TEAMCITY_REVIEW_BUILD_TYPE }}
           TEAMCITY_TOKEN: ${{ secrets.TEAMCITY_TOKEN }}
         run: |
-          python3 controller/regression-test/pipeline/code-review/main.py forward \
+          python3 controller/regression-test/pipeline/code-review/main.py forward --mode review \
             --event-file "$GITHUB_EVENT_PATH" --event-name "$GITHUB_EVENT_NAME" \
             --request-id "$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT" \
-            --origin-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             --teamcity-url "$TEAMCITY_URL" --teamcity-build-type "$TEAMCITY_BUILD_TYPE"
